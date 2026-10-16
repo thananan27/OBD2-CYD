@@ -1,0 +1,523 @@
+#define LGFX_USE_V1
+#include <LovyanGFX.hpp>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <FS.h>
+#include <SD.h>
+#include <SPI.h> // เรียกใช้ระบบบัสมาตรฐานแกนร่วม
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "time.h"
+
+class LGFX_ESP32_2432S028 : public lgfx::LGFX_Device {
+    lgfx::Panel_ILI9341  _panel_instance;
+    lgfx::Bus_SPI        _bus_instance;
+    lgfx::Touch_XPT2046  _touch_instance;
+public:
+    LGFX_ESP32_2432S028() {
+        {
+            auto cfg = _bus_instance.config();
+            cfg.spi_host = VSPI_HOST; cfg.spi_mode = 0;
+            cfg.freq_write = 40000000; cfg.freq_read  = 16000000;
+            cfg.pin_sclk = 14; cfg.pin_mosi = 13; cfg.pin_miso = 12; cfg.pin_dc   = 2;
+            _bus_instance.config(cfg); _panel_instance.setBus(&_bus_instance);
+        }
+        {
+            auto cfg = _panel_instance.config();
+            cfg.pin_cs     = 15; cfg.pin_rst    = -1; 
+            cfg.panel_width  = 240; cfg.panel_height = 320;
+            cfg.offset_rotation = 1; 
+            _panel_instance.config(cfg);
+        }
+        {
+            auto cfg = _touch_instance.config();
+            cfg.x_min      = 300; cfg.x_max      = 3900; cfg.y_min      = 200; cfg.y_max      = 3700;
+            cfg.pin_int    = 36; cfg.bus_shared = false; cfg.offset_rotation = 1; 
+            cfg.spi_host   = -1; cfg.pin_sclk   = 25; cfg.pin_mosi   = 32; cfg.pin_miso   = 39; cfg.pin_cs     = 33;       
+            _touch_instance.config(cfg); _panel_instance.setTouch(&_touch_instance); 
+        }
+        setPanel(&_panel_instance);
+    }
+};
+
+LGFX_ESP32_2432S028 lcd; 
+
+const char* target_mac = "00:10:cc:4f:36:03"; 
+static BLEUUID serviceUUID("0000fff0-0000-1000-8000-00805f9b34fb");
+static BLEUUID    charUUID("0000fff1-0000-1000-8000-00805f9b34fb"); 
+static BLEUUID   writeUUID("0000fff2-0000-1000-8000-00805f9b34fb"); 
+BLERemoteCharacteristic* pNotifyChar; BLERemoteCharacteristic* pWriteChar;
+BLEClient* pClient; bool connected = false; String obdResponse = ""; bool dataReceived = false;
+
+const char* ssid = "@IoT";
+const char* password = "1qaz2wsx";
+const char* nas_url = "http://192.168.10.204"; 
+
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 25200; 
+const int   daylightOffset_sec = 0;
+String timeTimeString = "--:--"; 
+
+enum OBDStates { GET_RPM, GET_SPEED, GET_COOLANT, GET_VOLTS, GET_IAT, GET_STFT, GET_LTFT, GET_VACUUM, GET_LOAD, GET_O2, GET_MAF };
+OBDStates obdState = GET_RPM;
+
+int currentPage = 1; unsigned long lastPagePress = 0;
+unsigned long lastDisplayUpdate = 0;
+unsigned long commandSentAt = 0;
+const unsigned long OBD_TIMEOUT_MS = 1800;
+const unsigned long DISPLAY_INTERVAL_MS = 250;
+float mafGps = 0.0f;
+float tripKm = 0.0f;
+float tripFuelLitres = 0.0f;
+float tripKpl = 0.0f;
+bool tripKplValid = false;
+unsigned long lastTripCalcTime = 0;
+bool resetTripRequested = false;
+
+uint32_t rpm = 0; int32_t currentSpeed = 0; int32_t coolant = 0; float voltage = 0.0; int32_t iat = 0;
+float stft = 0.0, ltft = 0.0, vacuum = 0.0, engineLoad = 0.0, o2Sensor = 0.0;
+int simulatedGear = 1;
+
+float virtualOdometer = 245273.0; 
+float serviceOil = 242480.0 + 5000.0;  
+float serviceGear = 223000.0 + 40000.0; 
+float servicePlug = 232460.0 + 100000.0; 
+
+unsigned long lastFuelCalcTime = 0; unsigned long lastLogTime = 0;
+String currentLogFile = "/obd_realtime_log.csv";
+String uploadStatus = "Ready";
+bool sdCardReady = false; // ตัวแปรคอยเช็กสถานะตัวอ่านการ์ด
+
+static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
+  for (size_t i = 0; i < length; i++) { if ((char)pData[i] == '>') dataReceived = true; else obdResponse += (char)pData[i]; }
+}
+bool sendOBDCommand(String cmd) {
+  if (!connected || pWriteChar == nullptr || pClient == nullptr || !pClient->isConnected()) return false;
+  obdResponse = "";
+  dataReceived = false;
+  cmd += "\r";
+  
+  // 🔥 [แก้ไขจุดนี้] ลบ "bool ok =" ออก เพราะฟังก์ชัน writeValue ไม่มีการคืนค่าสถานะใดๆ
+  pWriteChar->writeValue((uint8_t*)cmd.c_str(), cmd.length(), false);
+  
+  commandSentAt = millis();
+  return true; // พ่นสถานะ true กลับไปบอกว่าระบบได้สั่งจ่ายคำสั่งสำเร็จแล้ว
+}
+
+long hexToDec(String hexStr) { return strtol(hexStr.c_str(), NULL, 16); }
+
+bool connectToOBD2() {
+  BLEAddress obdAddress(target_mac);
+  if (pClient == nullptr) pClient = BLEDevice::createClient();
+  if (!pClient->connect(obdAddress)) {
+    Serial.println("BLE connect failed");
+    return false;
+  }
+  pClient->setMTU(185);
+  BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
+  if (pRemoteService == nullptr) {
+    Serial.println("OBD BLE service FFF0 not found");
+    pClient->disconnect();
+    return false;
+  }
+  pNotifyChar = pRemoteService->getCharacteristic(charUUID);
+  pWriteChar = pRemoteService->getCharacteristic(writeUUID);
+  if (pNotifyChar == nullptr || pWriteChar == nullptr || !pNotifyChar->canNotify() ||
+      !(pWriteChar->canWrite() || pWriteChar->canWriteNoResponse())) {
+    Serial.println("OBD BLE characteristics invalid");
+    pClient->disconnect();
+    pNotifyChar = nullptr; pWriteChar = nullptr;
+    return false;
+  }
+  pNotifyChar->registerForNotify(notifyCallback);
+  delay(150);
+  Serial.println("BLE OBD connected");
+  return true;
+}
+
+void resetTrip() {
+  tripKm = 0.0f;
+  tripFuelLitres = 0.0f;
+  tripKpl = 0.0f;
+  tripKplValid = false;
+  lastTripCalcTime = millis();
+  Serial.println("Trip reset");
+}
+
+void updateTripEconomy() {
+  unsigned long now = millis();
+  if (lastTripCalcTime == 0) { lastTripCalcTime = now; return; }
+  unsigned long dtMs = now - lastTripCalcTime;
+  lastTripCalcTime = now;
+  // Integrate only plausible intervals; speed is km/h and MAF is grams/second.
+  if (dtMs == 0 || dtMs > 2500 || currentSpeed < 0 || currentSpeed > 250) return;
+  float dtHours = dtMs / 3600000.0f;
+  if (currentSpeed > 0) tripKm += currentSpeed * dtHours;
+  // Gasoline estimate: AFR 14.7, fuel density 745 g/L. This is an estimate from PID 01 10 (MAF).
+  if (mafGps > 0.0f && mafGps < 300.0f) {
+    float fuelLps = mafGps / (14.7f * 745.0f);
+    tripFuelLitres += fuelLps * (dtMs / 1000.0f);
+  }
+  if (tripFuelLitres > 0.0005f) {
+    tripKpl = tripKm / tripFuelLitres;
+    tripKplValid = true;
+  }
+}
+
+bool parseHexByte(const String &s, int pos, uint8_t &out) {
+  if (pos < 0 || pos + 2 > (int)s.length()) return false;
+  char a=s[pos], b=s[pos+1];
+  if (!isxdigit(a) || !isxdigit(b)) return false;
+  char tmp[3] = {a,b,0}; out = (uint8_t)strtoul(tmp, nullptr, 16); return true;
+}
+
+String getFormattedTime() {
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)) return "TIME_UNSYNCED";
+  char timeFormatBuf[32];
+  strftime(timeFormatBuf, sizeof(timeFormatBuf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(timeFormatBuf);
+}
+
+void updateClockString() {
+  struct tm timeinfo;
+  if(getLocalTime(&timeinfo)){
+    char clockBuf[16]; strftime(clockBuf, sizeof(clockBuf), "%H:%M", &timeinfo);
+    timeTimeString = String(clockBuf);
+  }
+}
+
+// 💾 ฟังก์ชันบันทึกสถิติลงการ์ด (เพิ่มระบบตรวจเช็กการเข้าคิวพอร์ตบัส)
+void logDataToSD() {
+  if (!sdCardReady) return; // หากตอนเริ่มระบบเปิดการ์ดไม่ผ่าน จะไม่สั่งทำงานเพื่อกันบอร์ดเอ๋อ
+  
+  File logFile = SD.open(currentLogFile, FILE_APPEND);
+  if (logFile) {
+    String realTime = getFormattedTime();
+    logFile.printf("%s,%.2f,%u,%d,%d,%.1f,%d,%.2f,%.3f,%.3f,%.2f\n", realTime.c_str(), virtualOdometer, rpm, currentSpeed, coolant, voltage, iat, mafGps, tripKm, tripFuelLitres, tripKpl);
+    logFile.close();
+    Serial.println("Write SD Success!"); // ส่งหลักฐานฟ้องทางคอมพิวเตอร์ว่าบันทึกสำเร็จจริง
+  } else {
+    Serial.println("Failed to open file for appending");
+  }
+}
+
+void drawTopTachoBarDirect(int currentRpm) {
+  int startX = 12, startY = 24, barWidth = 14, barHeight = 18, gap = 4;
+  int totalBars = 12; 
+  int activeBars = map(currentRpm, 0, 7000, 0, totalBars);
+  if(activeBars > totalBars) activeBars = totalBars;
+
+  for (int i = 0; i < totalBars; i++) {
+    uint16_t color = lcd.color565(40, 40, 40); 
+    if (i < activeBars) {
+      if (i < 8) color = lcd.color565(173, 255, 47);   
+      else if (i < 10) color = TFT_YELLOW;             
+      else color = TFT_RED;                            
+    }
+    int px = startX + (i * (barWidth + gap));
+    for (int h = 0; h < barHeight; h++) {
+      int shiftX = (barHeight - h) / 3; 
+      lcd.drawFastHLine(px + shiftX, startY + h, barWidth, color);
+    }
+  }
+}
+
+void uploadFileToNAS() {
+  if (!sdCardReady) return;
+  uploadStatus = "Sending...";
+  HTTPClient http; http.begin(nas_url);
+  http.addHeader("Content-Type", "text/csv");
+  
+  File file = SD.open(currentLogFile, FILE_READ);
+  if (file) {
+    int httpResponseCode = http.sendRequest("POST", &file, file.size());
+    if (httpResponseCode > 0) uploadStatus = "Success NAS";
+    else uploadStatus = "HTTP Error";
+    file.close();
+  } else {
+    uploadStatus = "No File Log";
+  }
+  http.end();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(21, OUTPUT); digitalWrite(21, HIGH); 
+  
+  lcd.init(); lcd.setRotation(0); lcd.invertDisplay(false); lcd.fillScreen(TFT_BLACK);
+  lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  
+  // 🔥 [แก้ไขจุดสำคัญที่สุด] ย้ายระบบเริ่มทำงาน MicroSD Card พิน 5 มาเปิดที่บรรทัดแรกสุดของระบบ
+  Serial.println("Initializing SD card...");
+  if (SD.begin(5)) {
+    sdCardReady = true;
+    Serial.println("SD card initialized successfully.");
+    // ตรวจสอบเช็กสร้างหัวคอลัมน์ Excel ทันทีหากเป็นการ์ดใบใหม่แกะกล่อง
+    if (!SD.exists(currentLogFile)) {
+      File logFile = SD.open(currentLogFile, FILE_WRITE);
+      if (logFile) {
+        logFile.println("DateTime,Odometer,RPM,Speed,Coolant,Voltage,IAT,MAF_gps,Trip_km,Trip_fuel_L,Trip_KPL");
+        logFile.close();
+      }
+    }
+  } else {
+    sdCardReady = false;
+    Serial.println("SD card initialization failed!");
+  }
+
+  // เริ่มต้นต่อเชื่อม Wi-Fi เพื่อซิงค์ดึงนาฬิกา
+  lcd.drawString("Connecting Wi-Fi for NTP...", 10, 10);
+  WiFi.begin(ssid, password);
+  unsigned long wifiTimeout = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiTimeout < 4000) { delay(100); }
+  if(WiFi.status() == WL_CONNECTED) {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    delay(500); updateClockString();
+  }
+  WiFi.disconnect(true); 
+
+  lcd.fillScreen(TFT_BLACK);
+  lcd.drawString("NISSAN TIIDA SMART GAUGE", 10, 10);
+  lcd.drawString("Searching NEXPEAK BLE...", 10, 40);
+
+  BLEDevice::init("TIIDA_CYD_REAL");
+  lcd.drawString("BLE retrying...", 10, 65);
+  while (!connected) {
+    connected = connectToOBD2();
+    if (connected) {
+      sendOBDCommand("ATZ"); delay(900);
+      sendOBDCommand("ATE0"); delay(250);
+      sendOBDCommand("ATL0"); delay(150);
+      sendOBDCommand("ATS0"); delay(150);
+      sendOBDCommand("ATSP0"); delay(250);
+      uploadStatus = "Connected";
+    } else {
+      delay(1200);
+    }
+  }
+  lcd.fillScreen(TFT_BLACK);
+  lastFuelCalcTime = millis(); lastLogTime = millis(); lastTripCalcTime = millis();
+}
+
+void loop() {
+  static unsigned long lastClockUpdate = 0;
+  if (millis() - lastClockUpdate > 60000 || lastClockUpdate == 0) { lastClockUpdate = millis(); updateClockString(); }
+
+  int touchX = 0, touchY = 0;
+  if (lcd.getTouch(&touchX, &touchY)) {
+    if (touchX >= 225 && touchX <= 320 && touchY >= 210 && touchY <= 240) {
+      if (millis() - lastPagePress > 500) { lastPagePress = millis(); currentPage++; if (currentPage > 4) currentPage = 1; lcd.fillScreen(TFT_BLACK); }
+    }
+    if (currentPage == 3 && touchX >= 10 && touchX <= 120 && touchY >= 210 && touchY <= 240) {
+      if (millis() - lastPagePress > 800) { lastPagePress = millis(); uploadFileToNAS(); }
+    }
+    if (currentPage == 4 && touchX >= 10 && touchX <= 120 && touchY >= 210 && touchY <= 240) {
+      if (millis() - lastPagePress > 800) { lastPagePress = millis(); resetTrip(); lcd.fillScreen(TFT_BLACK); }
+    }
+  }
+
+  if (connected && (pClient == nullptr || !pClient->isConnected())) {
+    connected = false; pNotifyChar = nullptr; pWriteChar = nullptr;
+    Serial.println("BLE disconnected; reconnecting");
+  }
+  if (!connected) {
+    static unsigned long lastReconnectAttempt = 0;
+    if (millis() - lastReconnectAttempt > 2000) {
+      lastReconnectAttempt = millis();
+      connected = connectToOBD2();
+      if (connected) { sendOBDCommand("ATE0"); delay(150); sendOBDCommand("ATSP0"); delay(150); }
+    }
+  }
+  if (connected) {
+    static unsigned long lastQueryTime = 0;
+    static bool waitingForData = false;
+    if (waitingForData && (dataReceived || millis() - commandSentAt > OBD_TIMEOUT_MS)) {
+      String response = obdResponse;
+      response.replace("\r", ""); response.replace("\n", ""); response.replace(" ", ""); response.toUpperCase();
+      waitingForData = false;
+      dataReceived = false;
+      bool parsed = false;
+      if (obdState == GET_VOLTS) {
+        response.replace("V", "");
+        float v = response.toFloat();
+        if (v >= 5.0f && v <= 20.0f) { voltage = v; parsed = true; }
+        obdState = GET_IAT;
+      } else {
+        const char* expected[] = {"410C","410D","4105","","410F","4106","4107","410B","4104","4114","4110"};
+        String pid = expected[(int)obdState];
+        int idx = response.indexOf(pid);
+        uint8_t A=0, B=0, C=0, D=0;
+        if (idx >= 0 && parseHexByte(response, idx + pid.length(), A)) {
+          switch (obdState) {
+            case GET_RPM:
+              if (parseHexByte(response, idx+6, B)) { uint32_t value=((uint32_t)A*256U+B)/4U; if(value<=12000){rpm=value; parsed=true;} }
+              obdState=GET_SPEED; break;
+            case GET_SPEED: if(A<=250){currentSpeed=A; parsed=true;} obdState=GET_COOLANT; break;
+            case GET_COOLANT: {int v=(int)A-40; if(v>=-40 && v<=215){coolant=v; parsed=true;}} obdState=GET_VOLTS; break;
+            case GET_IAT: {int v=(int)A-40; if(v>=-40 && v<=215){iat=v; parsed=true;}} obdState=GET_STFT; break;
+            case GET_STFT: stft=((int)A-128)*100.0f/128.0f; parsed=true; obdState=GET_LTFT; break;
+            case GET_LTFT: ltft=((int)A-128)*100.0f/128.0f; parsed=true; obdState=GET_VACUUM; break;
+            case GET_VACUUM: {float mapKpa=A; float vac=(101.325f-mapKpa)*0.2953f; if(vac<0)vac=0; if(vac<=30){vacuum=vac;parsed=true;}} obdState=GET_LOAD; break;
+            case GET_LOAD: engineLoad=A*100.0f/255.0f; parsed=true; obdState=GET_O2; break;
+            case GET_O2:
+              if(parseHexByte(response,idx+6,B)) { float v=A/200.0f; if(v<=1.3f){o2Sensor=v;parsed=true;} }
+              obdState=GET_MAF; break;
+            case GET_MAF:
+              if(parseHexByte(response,idx+6,B)) {float maf=((uint16_t)A*256U+B)/100.0f; if(maf<300){mafGps=maf;parsed=true;}}
+              obdState=GET_RPM; break;
+            default: obdState=GET_RPM; break;
+          }
+        } else {
+          // Unsupported PID/no data: advance the queue and keep last valid reading.
+          obdState = (OBDStates)(((int)obdState + 1) % 11);
+          if (obdState == GET_VOLTS) { /* ATRV is queried next */ }
+        }
+      }
+      if (!parsed) Serial.printf("OBD no valid data; state=%d response=%s\n", (int)obdState, response.c_str());
+    }
+    if (!waitingForData && millis() - lastQueryTime >= 120) {
+      lastQueryTime = millis();
+      const char* commands[] = {"010C","010D","0105","ATRV","010F","0106","0107","010B","0104","0114","0110"};
+      if (sendOBDCommand(commands[(int)obdState])) waitingForData = true;
+      else { connected = false; }
+    }
+    updateTripEconomy();
+    unsigned long currentTime = millis();
+    float timeElapsedHours = (float)(currentTime - lastFuelCalcTime) / 3600000.0f;
+    if (lastFuelCalcTime > 0 && timeElapsedHours > 0 && timeElapsedHours < 0.05f && currentSpeed > 0 && currentSpeed < 250) {
+      virtualOdometer += ((float)currentSpeed * timeElapsedHours);
+    }
+    lastFuelCalcTime = currentTime;
+  }
+
+
+simulatedGear = (currentSpeed < 20) ? 1 : (currentSpeed < 50) ? 2 : (currentSpeed < 85) ? 3 : (currentSpeed < 110) ? 4 : 5;
+// วงจรสั่งเซฟประวัติลงการ์ดทุกๆ 1 วินาทีเต็มพิกัด [1.2]
+if (millis() - lastLogTime > 1000) { lastLogTime = millis(); logDataToSD(); }
+if (millis() - lastDisplayUpdate < DISPLAY_INTERVAL_MS) { delay(2); return; }
+lastDisplayUpdate = millis();
+char bufRPM[16]; char bufODO[24]; char bufOther[32];
+uint16_t themeColor = lcd.color565(173, 255, 47);
+if (currentPage == 1) {
+// Clear RPM region first, then redraw the tachometer bar so the two do not overlap.
+lcd.fillRect(10, 34, 182, 58, TFT_BLACK);
+drawTopTachoBarDirect(rpm);
+lcd.setFont(&fonts::Font0);
+lcd.setTextColor(themeColor, TFT_BLACK); lcd.drawString("  REDLINE", 5, 2);
+lcd.setTextColor(TFT_GREEN, TFT_BLACK);  lcd.drawString(sdCardReady ? "SD OK  " : "SD ERR  ", 100, 2); // เปลี่ยนแถบเพื่อเช็กสถานะการ์ดหน้าจอหลัก
+lcd.setTextColor(TFT_WHITE, TFT_BLACK);  lcd.drawString(timeTimeString.c_str(), 190, 2);
+// Redraw only the RPM digits inside the cleared region.
+lcd.setFont(&fonts::Font7); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+snprintf(bufRPM, sizeof(bufRPM), "%u", (unsigned int)rpm);
+lcd.drawString(bufRPM, 15, 38);
+lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_YELLOW, TFT_BLACK); lcd.drawString("RPM", 195, 65);
+lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK); lcd.drawString("ODO:", 12, 100);
+lcd.fillRect(42, 92, 184, 34, TFT_BLACK);
+lcd.setFont(&fonts::Font4); lcd.setTextColor(themeColor, TFT_BLACK);
+snprintf(bufODO, sizeof(bufODO), "%7.1f km", virtualOdometer); lcd.drawString(bufODO, 45, 94);
+lcd.drawRoundRect(6, 130, 218, 76, 6, lcd.color565(50, 50, 50));
+lcd.setFont(&fonts::Font0); lcd.setTextColor(themeColor, TFT_BLACK); lcd.drawString("SPEED", 15, 160);
+lcd.setFont(&fonts::Font4); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+snprintf(bufOther, sizeof(bufOther), "%03d", currentSpeed); lcd.drawString(bufOther, 65, 148);
+lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK); lcd.drawString("km/h", 140, 160);
+lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_YELLOW, TFT_BLACK); lcd.drawString("GEAR", 175, 160);
+lcd.setFont(&fonts::Font4); lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+snprintf(bufOther, sizeof(bufOther), "%d", simulatedGear); lcd.drawString(bufOther, 202, 148);
+int rx = 232, rw = 82, rh = 54;
+lcd.drawRoundRect(rx, 35, rw, rh, 6, lcd.color565(60, 60, 60));
+lcd.setFont(&fonts::Font0); lcd.setTextColor(themeColor, TFT_BLACK); lcd.drawString("COOLANT", rx+6, 40);
+lcd.setFont(&fonts::Font4); lcd.setTextColor(coolant >= 98 ? TFT_RED : TFT_WHITE, TFT_BLACK); snprintf(bufOther, sizeof(bufOther), "%2d", coolant); lcd.drawString(bufOther, rx+6, 52);
+lcd.setFont(&fonts::Font0); lcd.drawString("C", rx+54, 62);
+lcd.drawFastHLine(rx+6, 79, 70, lcd.color565(40, 40, 40));
+int coolantBar = constrain(map(coolant, 0, 120, 0, 70), 0, 70);
+lcd.fillRect(rx+6, 79, coolantBar, 3, themeColor);
+lcd.drawRoundRect(rx, 96, rw, rh, 6, lcd.color565(60, 60, 60));
+lcd.setFont(&fonts::Font0); lcd.setTextColor(themeColor, TFT_BLACK); lcd.drawString("VOLTAGE", rx+6, 101);
+lcd.setFont(&fonts::Font4); lcd.setTextColor(themeColor, TFT_BLACK); snprintf(bufOther, sizeof(bufOther), "%4.1f", voltage); lcd.drawString(bufOther, rx+4, 113);
+lcd.setFont(&fonts::Font0); lcd.drawString("V", rx+66, 123);
+lcd.drawRoundRect(rx, 157, rw, rh, 6, lcd.color565(60, 60, 60));
+lcd.setFont(&fonts::Font0); lcd.setTextColor(themeColor, TFT_BLACK); lcd.drawString("INTAKE", rx+6, 162);
+lcd.setFont(&fonts::Font4); lcd.setTextColor(TFT_WHITE, TFT_BLACK); snprintf(bufOther, sizeof(bufOther), "%2d", iat); lcd.drawString(bufOther, rx+6, 174);
+lcd.setFont(&fonts::Font0); lcd.drawString("C", rx+54, 184);
+}
+else if (currentPage == 2) {
+lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_ORANGE, TFT_BLACK); lcd.drawString("PAGE 2: ECU DIAGNOSTIC DATA MONITOR", 10, 10);
+lcd.drawFastHLine(10, 26, 300, TFT_DARKGREY);
+int bx = 10, bw = 145, bh = 55;
+lcd.drawRoundRect(bx, 35, bw, bh, 4, TFT_DARKGREY); lcd.drawString("STFT BANK 1", bx+8, 40);
+lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_GREEN, TFT_BLACK); snprintf(bufOther, sizeof(bufOther), "%+5.1f %%", stft); lcd.drawString(bufOther, bx+8, 58);
+lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+lcd.drawRoundRect(bx+155, 35, bw, bh, 4, TFT_DARKGREY); lcd.drawString("LTFT BANK 1", bx+163, 40);
+lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_GREEN, TFT_BLACK); snprintf(bufOther, sizeof(bufOther), "%+5.1f %%", ltft); lcd.drawString(bufOther, bx+163, 58);
+lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+lcd.drawRoundRect(bx, 93, bw, bh, 4, TFT_DARKGREY); lcd.drawString("VACUUM PRESSURE", bx+8, 98);
+lcd.setFont(&fonts::Font2); snprintf(bufOther, sizeof(bufOther), "%4.1f inHg", vacuum); lcd.drawString(bufOther, bx+8, 116);
+lcd.setFont(&fonts::Font0);
+lcd.drawRoundRect(bx+155, 93, bw, bh, 4, TFT_DARKGREY); lcd.drawString("COOLANT TEMP", bx+163, 98);
+lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_CYAN, TFT_BLACK); snprintf(bufOther, sizeof(bufOther), "%3d deg C", coolant); lcd.drawString(bufOther, bx+163, 116);
+lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+lcd.drawRoundRect(bx, 151, bw, bh, 4, TFT_DARKGREY); lcd.drawString("ENGINE LOAD", bx+8, 156);
+lcd.setFont(&fonts::Font2); snprintf(bufOther, sizeof(bufOther), "%4.1f %%", engineLoad); lcd.drawString(bufOther, bx+8, 174);
+lcd.setFont(&fonts::Font0);
+lcd.drawRoundRect(bx+155, 151, bw, bh, 4, TFT_DARKGREY); lcd.drawString("O2 B1S1 VOLTS", bx+163, 156);
+lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_YELLOW, TFT_BLACK); snprintf(bufOther, sizeof(bufOther), "%4.2f V", o2Sensor); lcd.drawString(bufOther, bx+163, 174);
+}
+else if (currentPage == 3) {
+lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_YELLOW, TFT_BLACK); lcd.drawString("PAGE 3: VEHICLE MAINTENANCE SCHEDULE", 10, 10);
+lcd.drawFastHLine(10, 26, 300, TFT_DARKGREY);
+lcd.setTextColor(TFT_WHITE, TFT_BLACK); lcd.drawString("CURRENT ODOMETER:", 15, 38);
+lcd.setFont(&fonts::Font2); lcd.setTextColor(themeColor, TFT_BLACK);
+snprintf(bufOther, sizeof(bufOther), "%7.1f km", virtualOdometer); lcd.drawString(bufOther, 140, 34);
+if (virtualOdometer >= serviceOil) lcd.setTextColor(TFT_RED, TFT_BLACK); else lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+lcd.setFont(&fonts::Font0); lcd.drawString("1. ENGINE OIL (น้ำมันเครื่อง - ทุกๆ 5,000 กม.)", 15, 65);
+snprintf(bufOther, sizeof(bufOther), "Next: %6.0f km", serviceOil); lcd.drawString(bufOther, 205, 65);
+lcd.drawFastHLine(15, 80, 290, lcd.color565(50,50,50));
+if (virtualOdometer >= serviceGear) lcd.setTextColor(TFT_RED, TFT_BLACK); else lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+lcd.drawString("2. TRANSMISSION FLUID (น้ำมันเกียร์ AT)", 15, 95);
+snprintf(bufOther, sizeof(bufOther), "Next: %6.0f km", serviceGear); lcd.drawString(bufOther, 205, 95);
+lcd.drawFastHLine(15, 110, 290, lcd.color565(50,50,50));
+if (virtualOdometer >= servicePlug) lcd.setTextColor(TFT_RED, TFT_BLACK); else lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+lcd.drawString("3. SPARK PLUGS (หัวเทียนอิริเดียม)", 15, 125);
+snprintf(bufOther, sizeof(bufOther), "Next: %6.0f km", servicePlug); lcd.drawString(bufOther, 205, 125);
+lcd.drawFastHLine(15, 140, 290, lcd.color565(50,50,50));
+// ปุ่มกดส่งข้อมูล CSV จาก SD การ์ดขึ้นตรงหา NAS [1.2]
+lcd.fillRect(10, 212, 110, 24, lcd.color565(120, 20, 20));
+lcd.drawRect(10, 212, 110, 24, TFT_RED);
+lcd.setTextColor(TFT_WHITE, lcd.color565(120, 20, 20));
+lcd.drawString("🚀 CSV TO NAS", 18, 220);
+lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
+snprintf(bufOther, sizeof(bufOther), "Status: %s", uploadStatus.c_str());
+lcd.drawString(bufOther, 130, 220);
+}
+else if (currentPage == 4) {
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+  lcd.drawString("PAGE 4: TRIP FUEL ECONOMY", 10, 10);
+  lcd.drawFastHLine(10, 26, 300, TFT_DARKGREY);
+  lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK); lcd.drawString("TRIP DISTANCE", 18, 43);
+  lcd.setFont(&fonts::Font4); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  snprintf(bufOther, sizeof(bufOther), "%.2f km", tripKm); lcd.drawString(bufOther, 18, 60);
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK); lcd.drawString("FUEL USED (EST.)", 18, 105);
+  lcd.setFont(&fonts::Font4); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  snprintf(bufOther, sizeof(bufOther), "%.3f L", tripFuelLitres); lcd.drawString(bufOther, 18, 122);
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK); lcd.drawString("AVERAGE ECONOMY", 18, 166);
+  lcd.setFont(&fonts::Font4); lcd.setTextColor(themeColor, TFT_BLACK);
+  if (tripKplValid) snprintf(bufOther, sizeof(bufOther), "%.2f KPL", tripKpl);
+  else snprintf(bufOther, sizeof(bufOther), "--.-- KPL");
+  lcd.drawString(bufOther, 150, 160);
+  lcd.fillRect(10, 212, 110, 24, lcd.color565(120, 20, 20));
+  lcd.drawRect(10, 212, 110, 24, TFT_RED);
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_WHITE, lcd.color565(120, 20, 20));
+  lcd.drawString("RESET TRIP", 22, 220);
+  lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  lcd.drawString("MAF: ", 145, 220);
+  snprintf(bufOther, sizeof(bufOther), "%.1f g/s", mafGps); lcd.drawString(bufOther, 180, 220);
+}
+lcd.fillRect(235, 212, 80, 24, lcd.color565(20, 50, 20));
+lcd.drawRect(235, 212, 80, 24, themeColor);
+lcd.setFont(&fonts::Font0); lcd.setTextColor(themeColor, lcd.color565(20, 50, 20));
+lcd.drawString("NEXT ⏩", 256, 220);
+delay(2);
+}
