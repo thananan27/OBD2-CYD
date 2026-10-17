@@ -84,6 +84,12 @@ float servicePlug = 250000.0;
 unsigned long lastFuelCalcTime = 0;
 String uploadStatus = "Ready";
 
+// 🟢 เติมตัวแปรระบบ SD Card และตัวจับเวลาที่โค้ดน้าตกหล่นตรงนี้ครับ
+bool sdCardReady = false; 
+String currentLogFile = "/tiida_log.csv"; 
+unsigned long lastLogTime = 0; 
+
+
 // 🟢 เพิ่มเติม: ตัวแปรสำหรับการคำนวณทริปและค่าน้ำมันในหน้า 4
 float tripKm = 0.0;
 float tripFuelLitres = 0.0;
@@ -161,22 +167,19 @@ void logDataToSD() {
 
 void uploadFileToNAS() {
   uploadStatus = "Saving SD...";
-  // 2. ระบบส่งข้อมูลเข้า NAS (โค้ดเดิมของคุณ)
   uploadStatus = "WiFi Conn...";
   WiFi.begin(ssid, password);
   unsigned long startAttempt = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 6000) { delay(200); }
   
-    if (WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED) {
     uploadStatus = "Sending...";
-    HTTPClient http; 
+    HTTPClient http;
     http.begin(nas_url);
     http.addHeader("Content-Type", "text/csv");
     
-    // 🟢 เปลี่ยนมาเปิดไฟล์ตรงจาก MicroSD Card นำส่งแทนตัวแปร String เก่า
     File file = SD.open(currentLogFile, FILE_READ);
     if (file) {
-      // ส่งแบบ Stream พอยเตอร์ (Stream*)&file ไฟล์ใหญ่แค่ไหนแรมก็ไม่เต็ม บอร์ดไม่ดับ
       int httpResponseCode = http.sendRequest("POST", (Stream*)&file, file.size());
       if (httpResponseCode > 0) uploadStatus = "Success NAS";
       else uploadStatus = "HTTP Error";
@@ -186,6 +189,8 @@ void uploadFileToNAS() {
     }
     http.end();
   }
+} // 🟢 เติมปีกกาปิดท้ายฟังก์ชันตัวนี้ที่ขาดหายไป เพื่อตัดจบไม่ให้กินฟังก์ชัน setup ครับ!
+
 
 
 void setup() {
@@ -221,8 +226,14 @@ void setup() {
     // เพิ่มคำสั่งเปิดระบบ SD Card ในพินบอร์ด CYD (SPI พินพ่วงจอ)
   if(!SD.begin(5)){ // พิน CS ของ SD Card บอร์ด CYD ปกติคือพิน 5
     Serial.println("Card Mount Failed");
+    sdCardReady = false; 
+  } else {
+    Serial.println("Card Mount Success");
+    sdCardReady = true;  // 🟢 เติมตรงนี้เพื่อให้ระบบรู้ว่าการ์ดพร้อมอัดข้อมูลแล้วครับ
   }
   lastFuelCalcTime = millis();
+}
+
 }
 void loop() {
   // --- 1. ระบบเช็กทัชสกรีนสลับหน้าจอ (ปุ่ม NEXT ขวาล่าง) ---
