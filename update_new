@@ -77,9 +77,9 @@ float stft = 0.0, ltft = 0.0, vacuum = 0.0, engineLoad = 0.0, o2Sensor = 0.0;
 int simulatedGear = 1;
 
 // 🚗 ระบบคำนวณระยะทางไมล์จำลองและการซ่อมบำรุง
-float virtualOdometer = 152340.0; 
-float serviceOil = 160000.0;    
-float serviceGear = 180000.0;   
+float virtualOdometer = 245327.0; 
+float serviceOil = 247480.0;    
+float serviceGear = 248000.0;   
 float servicePlug = 250000.0;   
 unsigned long lastFuelCalcTime = 0;
 String uploadStatus = "Ready";
@@ -234,7 +234,6 @@ void setup() {
   lastFuelCalcTime = millis();
 }
 
-}
 void loop() {
   // --- 1. ระบบเช็กทัชสกรีนสลับหน้าจอ (ปุ่ม NEXT ขวาล่าง) ---
   int touchX = 0, touchY = 0;
