@@ -180,39 +180,38 @@ void drawTopTachoBarDirect(int currentRpm) {
   }
 }
 
-// 💾 ฟังก์ชันบันทึกข้อมูลพร้อมวัน-เวลาลงการ์ด FAT32
+// 💾 ฟังก์ชันบันทึกข้อมูลพร้อมตัวนับเวลารันไทม์รถยนต์ (เวอร์ชันออฟไลน์ ไม่พึ่ง WiFi)
 void logDataToSD() {
   if (!sdCardReady) return; 
-  
-  // ดึงเวลาปัจจุบันจากระบบบอร์ด ESP32
-  struct tm timeinfo;
-  char timeStringBuff[30] = "00-00-0000 00:00:00"; // ค่าสำรองถ้าดึงเวลาไม่สำเร็จ
-  if (getLocalTime(&timeinfo)) {
-    // ฟอร์แมตให้ออกมาเป็น วัน-เดือน-ปี ชั่วโมง:นาที:วินาที
-    strftime(timeStringBuff, sizeof(timeStringBuff), "%d-%m-%Y %H:%M:%S", &timeinfo);
-  }
+
+  // คำนวณเวลานับสะสมตั้งแต่เปิดเครื่อง (ชั่วโมง:นาที:วินาที) จาก millis()
+  unsigned long totalSeconds = millis() / 1000;
+  int seconds = totalSeconds % 60;
+  int minutes = (totalSeconds / 60) % 60;
+  int hours = (totalSeconds / 3600);
+
+  char timeStringBuff[30];
+  snprintf(timeStringBuff, sizeof(timeStringBuff), "RunTime %02d:%02d:%02d", hours, minutes, seconds);
 
   File file = SD.open(currentLogFile, FILE_APPEND); 
   if (file) {
-    // 🟢 คอลัมน์ที่ 1: ใส่วันและเวลาจริงกำกับไว้ข้างหน้าสุด
     file.print(timeStringBuff);             file.print(","); 
-    
-    // คอลัมน์ที่เหลือ (ไมล์, ความร้อน, โวลต์, ทริป, ค่าน้ำมัน)
     file.print(String(virtualOdometer, 1)); file.print(",");
     file.print(coolant);                    file.print(",");
     file.print(String(voltage, 1));         file.print(",");
     file.print(String(tripKm, 2));          file.print(",");
-    file.print(String(tripKpl, 2));         file.print(",");
+    file.print(String(tripKpl, 2));         file.print(","); 
     file.print(String(stft, 1));            file.print(",");
-    file.println(String(ltft, 1));          // บันทึกค่าสุดท้ายเสร็จแล้วปัดขึ้นบรรทัดใหม่ทันที
+    file.println(String(ltft, 1));          
     
-    file.flush(); // บังคับเซฟลงการ์ดทันทีป้องกันไฟล์เสีย
+    file.flush(); 
     file.close(); 
     Serial.print("💾 SD Saved Auto with Time: "); Serial.println(timeStringBuff);
   } else {
     Serial.println("❌ SD Card Write Error!");
   }
 }
+
 
 
 // 🔄 2. ฟังก์ชันดึงเลขไมล์กิโลเมตรล่าสุดจาก SD Card กลับมานับต่อตอนเปิดเครื่อง
