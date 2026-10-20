@@ -1,0 +1,694 @@
+#define LGFX_USE_V1
+#include <LovyanGFX.hpp>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <FS.h>
+#include <SPI.h>
+#include <SD.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>               // 🟢 เพิ่มไลบรารีสำหรับจัดการระบบเวลาจริง
+const char* ntpServer = "pool.ntp.org"; // เซิร์ฟเวอร์ขอเวลาสากล
+const long  gmtOffset_sec = 25200;      // ปรับเวลาให้ตรงกับประเทศไทย (GMT+7 คือ 7 * 3600)
+const int   daylightOffset_sec = 0;
+
+
+
+// =======================================================
+// 💻 โครงสร้างคลาสตั้งค่าพินดั้งเดิมตามผังบอร์ดจริงของคุณ
+// =======================================================
+class LGFX_ESP32_2432S028 : public lgfx::LGFX_Device {
+    lgfx::Panel_ILI9341  _panel_instance;
+    lgfx::Bus_SPI        _bus_instance;
+    lgfx::Touch_XPT2046  _touch_instance;
+public:
+    LGFX_ESP32_2432S028() {
+        {
+            auto cfg = _bus_instance.config();
+            cfg.spi_host = HSPI_HOST; 
+            cfg.spi_mode = 0;
+            cfg.freq_write = 40000000; 
+            cfg.freq_read  = 16000000;
+            cfg.pin_sclk = 14; 
+            cfg.pin_mosi = 13; 
+            cfg.pin_miso = 12; 
+            cfg.pin_dc   = 2;
+            _bus_instance.config(cfg); _panel_instance.setBus(&_bus_instance);
+        }
+        {
+            auto cfg = _panel_instance.config();
+            cfg.pin_cs     = 15; 
+            cfg.pin_rst    = -1; 
+            cfg.panel_width  = 240; 
+            cfg.panel_height = 320;
+            cfg.offset_rotation = 1; 
+            _panel_instance.config(cfg);
+        }
+        {
+            auto cfg = _touch_instance.config();
+            cfg.x_min      = 300; 
+            cfg.x_max      = 3900; 
+            cfg.y_min      = 200; 
+            cfg.y_max      = 3700;
+            cfg.pin_int    = 36; 
+            cfg.bus_shared = false; 
+            cfg.offset_rotation = 1; 
+            cfg.spi_host   = -1; 
+            cfg.pin_sclk   = 25; 
+            cfg.pin_mosi   = 32; 
+            cfg.pin_miso   = 39; 
+            cfg.pin_cs     = 33;       
+            _touch_instance.config(cfg); _panel_instance.setTouch(&_touch_instance); 
+        }
+        setPanel(&_panel_instance);
+    }
+};
+
+LGFX_ESP32_2432S028 lcd; 
+
+SPIClass sdSPI(VSPI);
+;
+#define SD_CS   5
+#define SD_SCLK 18
+#define SD_MISO 19
+#define SD_MOSI 23
+
+// =======================================================
+// 🚗 พันธะโครงสร้างเชื่อมต่อบลูทูธ OBD2 แท้จริงในรถยนต์ของคุณ
+// =======================================================
+const char* target_mac = "00:10:cc:4f:36:03"; 
+static BLEUUID serviceUUID("0000fff0-0000-1000-8000-00805f9b34fb");
+static BLEUUID    charUUID("0000fff1-0000-1000-8000-00805f9b34fb"); 
+static BLEUUID   writeUUID("0000fff2-0000-1000-8000-00805f9b34fb"); 
+
+BLERemoteCharacteristic* pNotifyChar; 
+BLERemoteCharacteristic* pWriteChar;
+BLEClient* pClient; 
+bool connected = false; 
+String obdResponse = ""; 
+bool dataReceived = false;
+
+// 🌐 ตั้งค่าระบบเครือข่ายสำหรับส่งข้อมูลเข้าเครื่องคอมพิวเตอร์/NAS (หน้า 3)
+const char* ssid = "@IoT";
+const char* password = "1qaz2wsx";
+const char* nas_url = "http://192.168.10.204"; 
+
+// 🟢 แก้ไข: เพิ่ม GET_MAF เข้าไปในระบบลำดับคำสั่ง PIDs
+enum OBDStates { GET_RPM, GET_SPEED, GET_COOLANT, GET_VOLTS, GET_IAT, GET_STFT, GET_LTFT, GET_VACUUM, GET_LOAD, GET_O2, GET_MAF };
+OBDStates obdState = GET_RPM;
+
+int currentPage = 1; unsigned long lastPagePress = 0;
+
+// ตัวแปรเก็บค่าจริงระบบเครื่องยนต์ (เริ่มต้นที่เลขศูนย์ทั้งหมด)
+uint32_t rpm = 0; int32_t currentSpeed = 0; int32_t coolant = 0; float voltage = 0.0; int32_t iat = 0;
+float stft = 0.0, ltft = 0.0, vacuum = 0.0, engineLoad = 0.0, o2Sensor = 0.0;
+int simulatedGear = 1;
+
+// 🚗 ระบบคำนวณระยะทางไมล์จำลองและการซ่อมบำรุง
+float virtualOdometer = 245327.0; 
+float serviceOil = 247480.0;    
+float serviceGear = 248000.0;   
+float servicePlug = 250000.0;   
+unsigned long lastFuelCalcTime = 0;
+String uploadStatus = "Ready";
+
+// 🟢 เติมตัวแปรระบบ SD Card และตัวจับเวลาที่โค้ดน้าตกหล่นตรงนี้ครับ
+bool sdCardReady = false; 
+String currentLogFile = "/tiidalog_new.csv"; // 🟢 เปลี่ยนชื่อไฟล์เล็กน้อยป้องกันระบบ FAT เก่าของการ์ดล็อกไฟล์
+unsigned long lastLogTime = 0; 
+
+
+// 🟢 เพิ่มเติม: ตัวแปรสำหรับการคำนวณทริปและค่าน้ำมันในหน้า 4
+float tripKm = 0.0;
+float tripFuelLitres = 0.0;
+float tripKpl = 0.0;
+float mafGps = 0.0;
+bool tripKplValid = false;
+char bufOther[32]; 
+
+static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
+  for (size_t i = 0; i < length; i++) { 
+    char c = (char)pData[i];
+    if (c == '>') dataReceived = true; 
+    else obdResponse += c; 
+  }
+}
+
+void sendOBDCommand(String cmd) { 
+  if (!connected || pWriteChar == nullptr) return; 
+  obdResponse = ""; dataReceived = false; cmd += "\r"; 
+  pWriteChar->writeValue((uint8_t*)cmd.c_str(), cmd.length(), false); 
+}
+
+long hexToDec(String hexStr) { return strtol(hexStr.c_str(), NULL, 16); }
+
+bool connectToOBD2() {
+    BLEAddress obdAddress(target_mac); 
+    pClient = BLEDevice::createClient();
+    if (!pClient->connect(obdAddress)) return false;
+    pClient->setMTU(512); 
+    BLERemoteService* pRemoteService = pClient->getService(serviceUUID); 
+    if (pRemoteService == nullptr) return false;
+    pNotifyChar = pRemoteService->getCharacteristic(charUUID); 
+    pWriteChar = pRemoteService->getCharacteristic(writeUUID);
+    if (pNotifyChar == nullptr || pWriteChar == nullptr) return false;
+    if (pNotifyChar->canNotify()) pNotifyChar->registerForNotify(notifyCallback);
+    return true;
+}
+
+
+void drawTopTachoBarDirect(int currentRpm) {
+  int startX = 12, startY = 28, barWidth = 14, barHeight = 22, gap = 4;
+  int totalBars = 12; 
+  int activeBars = map(currentRpm, 0, 7000, 0, totalBars);
+  if(activeBars > totalBars) activeBars = totalBars;
+
+  for (int i = 0; i < totalBars; i++) {
+    uint16_t color = lcd.color565(40, 40, 40); 
+    if (i < activeBars) {
+      if (i < 8) color = lcd.color565(173, 255, 47);   
+      else if (i < 10) color = TFT_YELLOW;             
+      else color = TFT_RED;                            
+    }
+    int px = startX + (i * (barWidth + gap));
+    for (int h = 0; h < barHeight; h++) {
+      int shiftX = (barHeight - h) / 3; 
+      lcd.drawFastHLine(px + shiftX, startY + h, barWidth, color);
+    }
+  }
+}
+
+// 💾 ฟังก์ชันบันทึกข้อมูลพร้อมวัน-เวลาลงการ์ด FAT32
+void logDataToSD() {
+  if (!sdCardReady) return; 
+  
+  // ดึงเวลาปัจจุบันจากระบบบอร์ด ESP32
+  struct tm timeinfo;
+  char timeStringBuff[30] = "00-00-0000 00:00:00"; // ค่าสำรองถ้าดึงเวลาไม่สำเร็จ
+  if (getLocalTime(&timeinfo)) {
+    // ฟอร์แมตให้ออกมาเป็น วัน-เดือน-ปี ชั่วโมง:นาที:วินาที
+    strftime(timeStringBuff, sizeof(timeStringBuff), "%d-%m-%Y %H:%M:%S", &timeinfo);
+  }
+
+  File file = SD.open(currentLogFile, FILE_APPEND); 
+  if (file) {
+    // 🟢 คอลัมน์ที่ 1: ใส่วันและเวลาจริงกำกับไว้ข้างหน้าสุด
+    file.print(timeStringBuff);             file.print(","); 
+    
+    // คอลัมน์ที่เหลือ (ไมล์, ความร้อน, โวลต์, ทริป, ค่าน้ำมัน)
+    file.print(String(virtualOdometer, 1)); file.print(",");
+    file.print(coolant);                    file.print(",");
+    file.print(String(voltage, 1));         file.print(",");
+    file.print(String(tripKm, 2));          file.print(",");
+    file.print(String(tripKpl, 2));         file.print(",");
+    file.print(String(stft, 1));            file.print(",");
+    file.println(String(ltft, 1));          // บันทึกค่าสุดท้ายเสร็จแล้วปัดขึ้นบรรทัดใหม่ทันที
+    
+    file.flush(); // บังคับเซฟลงการ์ดทันทีป้องกันไฟล์เสีย
+    file.close(); 
+    Serial.print("💾 SD Saved Auto with Time: "); Serial.println(timeStringBuff);
+  } else {
+    Serial.println("❌ SD Card Write Error!");
+  }
+}
+
+
+// 🔄 2. ฟังก์ชันดึงเลขไมล์กิโลเมตรล่าสุดจาก SD Card กลับมานับต่อตอนเปิดเครื่อง
+// 🔄 ฟังก์ชันอ่านเลขไมล์ล่าสุดจาก SD Card (เวอร์ชันเจาะจงคอมมาช่องที่ 2 ดึงค่าแม่นยำ 100%)
+void loadLatestOdometerFromSD() {
+  if (!SD.exists(currentLogFile)) {
+    Serial.println("ℹ️ No log file found. Using default odometer.");
+    return;
+  }
+  
+  // จัดระเบียบลำดับบัสสลับช่องสัญญาณดักหน้าจอค้าง
+  digitalWrite(15, HIGH); 
+  digitalWrite(33, HIGH);
+  digitalWrite(5, LOW);
+  delay(10);
+
+  File file = SD.open(currentLogFile, FILE_READ);
+  if (file) {
+    String lastLine = "";
+    
+    // วนลูปสแกนหาบรรทัดล่าสุดล่างสุดของไฟล์จริง
+    while (file.available()) {
+      String line = file.readStringUntil('\n');
+      line.trim();
+      if (line.length() > 0) {
+        lastLine = line; // เก็บประวัติบรรทัดล่าสุดไว้
+      }
+    }
+    file.close();
+    
+    // 🟩 ถอดรหัสเจาะหาตัวเลข Odometer ระหว่างคอมมาตัวที่ 1 และตัวที่ 2
+    if (lastLine.length() > 0) {
+      int firstComma = lastLine.indexOf(',');
+      if (firstComma > 0) {
+        // หาคอมมาตัวที่สองถัดไป
+        int secondComma = lastLine.indexOf(',', firstComma + 1);
+        if (secondComma > firstComma) {
+          // ดึงข้อความเฉพาะช่องที่สองซึ่งเป็นตัวเลขไมล์ล้วนๆ
+          String odoStr = lastLine.substring(firstComma + 1, secondComma);
+          odoStr.trim();
+          
+          float savedOdo = odoStr.toFloat();
+          if (savedOdo > 100.0) { // ดักค่าเออเร่อกรณีเป็น 0
+            virtualOdometer = savedOdo;
+            Serial.print("💾 [SD Success] Loaded Odometer from Card: ");
+            Serial.println(virtualOdometer, 1);
+          }
+        }
+      }
+    }
+  }
+
+  // คืนสัญญาณระบบจราจรบัสหลักกลับสู่จอและทัชสกรีน
+  digitalWrite(5, HIGH);
+  digitalWrite(15, HIGH); 
+//  digitalWrite(33, LOW); 
+  delay(10);
+}
+
+
+
+
+void uploadFileToNAS() {
+  uploadStatus = "Saving SD...";
+  uploadStatus = "WiFi Conn...";
+  WiFi.begin(ssid, password);
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 6000) { delay(200); }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    uploadStatus = "Sending...";
+    HTTPClient http;
+    http.begin(nas_url);
+    http.addHeader("Content-Type", "text/csv");
+    
+    File file = SD.open(currentLogFile, FILE_READ);
+    if (file) {
+      int httpResponseCode = http.sendRequest("POST", (Stream*)&file, file.size());
+      if (httpResponseCode > 0) uploadStatus = "Success NAS";
+      else uploadStatus = "HTTP Error";
+      file.close();
+    } else {
+      uploadStatus = "No File Log";
+    }
+    http.end();
+  }
+} // 🟢 เติมปีกกาปิดท้ายฟังก์ชันตัวนี้ที่ขาดหายไป เพื่อตัดจบไม่ให้กินฟังก์ชัน setup ครับ!
+
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(200); 
+
+  // 1. บังคับเปิดไฟ Backlight หน้าจอ CYD ให้สว่างทันที
+  pinMode(21, OUTPUT);
+  digitalWrite(21, HIGH);
+
+  // 🟢 2. [จุดสำคัญ] สั่งล็อกขา CS ของทุกอุปกรณ์ให้อยู่สถานะ HIGH (ปิดบัส) ตั้งแต่วินาทีแรก!
+  // เพื่อป้องกันไม่ให้ชิป SD Card หรือชิปทัชสกรีนแอบปล่อยสัญญาณมาสะดุดขาหน้าจอตอนเปิดเครื่อง
+  pinMode(15, OUTPUT);  digitalWrite(15, HIGH); // ปิดบัสหน้าจอชั่วคราว
+  pinMode(33, OUTPUT);  digitalWrite(33, HIGH); // ปิดบัสทัชสกรีน
+  pinMode(5, OUTPUT);   digitalWrite(5, HIGH);  // ปิดบัส SD Card ดักไว้ก่อนเลยครับน้า
+
+  // 3. เริ่มต้นเปิดระบบหน้าจอหลักให้เสร็จสมบูรณ์รวดเดียว
+  digitalWrite(15, LOW); // เปิดเฉพาะบัสจอเพื่อให้สั่งงานได้
+  lcd.init(); 
+  lcd.setRotation(0); 
+  lcd.fillScreen(TFT_BLACK);
+  
+  lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.drawString("NISSAN TIIDA OBD2 CLUSTER", 10, 10);
+  lcd.drawString("Initializing SD Card...", 10, 40);
+  digitalWrite(15, HIGH); // ทำงานหน้าจอเสร็จแล้ว ปิดบัสจอคืนระบบไป
+  delay(50);
+
+  // 4. เริ่มเปิดท่อส่งข้อมูล SPI แยก (sdSPI) ให้กับตัว MicroSD Card
+  sdSPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS); // ขา 18, 19, 23, 5
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  // บังคับเปิดระบบการ์ดผ่านท่อแยก ความเร็วปลอดภัย 4MHz
+  bool sdSuccess = SD.begin(SD_CS, sdSPI, 5500000); 
+
+  // 5. คืนอิสระให้บัสทั้งหมด (ปล่อย HIGH ไว้ เพื่อให้ไลบรารี LovyanGFX สลับหน้าคุยเองใน loop)
+  digitalWrite(15, LOW); 
+  digitalWrite(33, LOW);
+  delay(50);
+  // 6. ตรวจสอบการ Mount และโหลดเลขไมล์สะสม
+  if (!sdSuccess) {
+    Serial.println("❌ Card Mount Failed");
+    sdCardReady = false;
+    lcd.setTextColor(TFT_RED, TFT_BLACK);
+    lcd.drawString("SD Card Failed!", 10, 70);
+  } else {
+    Serial.println("🟢 Card Mount Success");
+    sdCardReady = true;
+    
+    // ดึงตัวเลขกิโลเมตรล่าสุดจาก SD Card มานับต่อทันที
+    loadLatestOdometerFromSD(); 
+  }
+  pinMode(33, OUTPUT);
+  digitalWrite(33, HIGH);  // 🟩 สั่ง LOW เพื่อเปิดสวิตช์เรียกชิปทัชสกรีนให้ตื่นมารับรู้ลายนิ้วมือ
+  delay(10);
+  
+  lcd.setRotation(0);      // บังคับให้ LovyanGFX จัดการพิกัดหน้าจอกับทัชสกรีนเป็นแนวนอนตรงกัน
+  lcd.clear(); 
+  // 7. บังคับสร้างไฟล์และโครงสร้างคอลัมน์ Excel ครั้งแรก
+  if (sdCardReady) {
+    if (!SD.exists(currentLogFile)) {
+      File file = SD.open(currentLogFile, FILE_WRITE);
+      if (file) {
+        file.println("DateTime,Odometer,Coolant,Voltage,TripKm,TripKpl,Slcd,Llcd");
+        file.println("RunTime 00:00:00,245327.0,80,14.1,0.00,0.00,+0.0,+0.0");
+        file.flush();
+        file.close();
+        Serial.println("🟢 [SD Test] Created tiidalog_new.csv successfully.");
+      }
+    }
+  }
+
+  // 8. ตั้งค่านาฬิกาและข้ามระบบค้นหาบลูทูธเพื่อเทสในบ้านชั่วคราว
+  connected = true; 
+  lastFuelCalcTime = millis();
+  lcd.fillScreen(TFT_BLACK);
+}
+
+
+
+
+void loop() {
+  // =======================================================
+  // 🟢 [สำหรับทดสอบในบ้าน] บังคับจำลองค่าเพื่อให้ไมล์เดินและ SD Card ทำงาน
+  // =======================================================
+  connected = true;       // หลอกบอร์ดว่าเชื่อมต่อรถแล้ว
+  currentSpeed = 80;      // สมมุติว่าขับรถอยู่ที่ความเร็ว 80 km/h
+  rpm = 2500;             // สมมุติรอบเครื่องอยู่ที่ 2500 RPM
+  coolant = 85;           // สมมุติความร้อน 85 องศา
+  voltage = 14.0;         // สมมุติโวลต์แบตเตอรี่ 14.0V
+  stft = 1.2;             // สมมุติค่า Trim
+  ltft = -0.5;
+  mafGps = 4.5;           // ใส่ค่า MAF จำลองเพื่อให้ระบบน้ำมันทำงาน
+  // =======================================================
+  // --- 1. ระบบเช็กทัชสกรีนสลับหน้าจอ (ปุ่ม NEXT ขวาล่าง) ---
+  static unsigned long lastTouchScan = 0;
+  int touchX = 0, touchY = 0;
+
+  // ตรวจทัชทุกครั้งที่ loop วนกลับมา (อย่างน้อยทุก 5 ms เมื่อไม่มีงานบล็อก)
+  // หมายเหตุ: การวาดจอ/เขียน SD อาจทำให้ loop ช้าลงชั่วคราว
+  if (millis() - lastTouchScan >= 5) {
+    lastTouchScan = millis();
+    
+    if (lcd.getTouch(&touchX, &touchY)) {
+      // 🔘 ปุ่ม NEXT ขวาล่างสุด (ขยายขอบเขตพิกัดเพิ่มความกว้างให้จิ้มง่ายดายขึ้น)
+      if (touchX >= 200 && touchX <= 320 && touchY >= 170 && touchY <= 240) {
+        if (millis() - lastPagePress > 350) { // ลดตัวหน่วงการเปลี่ยนหน้าให้เหลือแค่ 300ms
+          lastPagePress = millis();
+          currentPage++;
+          if (currentPage > 4) currentPage = 1;
+          
+          lcd.fillScreen(TFT_BLACK); // ล้างเฟรมจอเพื่อวาดหน้าปัดชุดถัดไปทันที
+          Serial.printf("⏩ ดีดเปลี่ยนหน้าจอทันใจ สลับไปหน้าย่อยที่: %d\n", currentPage);
+        }
+      }
+
+      // ปุ่มทัชสกรีน RESET TRIP (หน้า 4 ซ้ายล่าง)
+      if (currentPage == 4 && touchX >= 10 && touchX <= 110 && touchY >= 190 && touchY <= 240) {
+        if (millis() - lastPagePress > 800) {
+          lastPagePress = millis();
+          tripKm = 0.0;
+          tripFuelLitres = 0.0;
+          tripKpl = 0.0;
+          tripKplValid = false;
+          lcd.fillScreen(TFT_BLACK);
+        }
+      }
+    }
+  }
+
+  // --- 2. ลูปยิงสลับคำสั่งวิเคราะห์ PIDs จริงจากเครื่องยนต์ Nissan Tiida ---
+  if (connected) {
+    static unsigned long lastQueryTime = 0; static bool waitingForData = false;
+    if (!waitingForData && (millis() - lastQueryTime > 40)) {
+      lastQueryTime = millis(); waitingForData = true;
+      switch (obdState) {
+        case GET_RPM:     sendOBDCommand("010C"); break;
+        case GET_SPEED:   sendOBDCommand("010D"); break;
+        case GET_COOLANT: sendOBDCommand("0105"); break;
+        case GET_VOLTS:   sendOBDCommand("ATRV"); break;
+        case GET_IAT:     sendOBDCommand("010F"); break;
+        case GET_STFT:    sendOBDCommand("0106"); break;
+        case GET_LTFT:    sendOBDCommand("0107"); break;
+        case GET_VACUUM:  sendOBDCommand("010B"); break;
+        case GET_LOAD:    sendOBDCommand("0104"); break;
+        case GET_O2:      sendOBDCommand("0114"); break;
+        case GET_MAF:     sendOBDCommand("0110"); break;
+      }
+    }
+    
+    if (waitingForData && dataReceived) {
+      waitingForData = false; obdResponse.replace("\r", ""); obdResponse.replace("\n", ""); obdResponse.replace(" ", "");
+      if (obdResponse.indexOf("41") >= 0) {
+        int idx = obdResponse.indexOf("41"); String dataBytes = obdResponse.substring(idx + 4);
+        switch (obdState) {
+          case GET_RPM: rpm = (hexToDec(dataBytes.substring(0, 2)) * 256.0 + hexToDec(dataBytes.substring(2, 4))) / 4.0; obdState = GET_SPEED; break;
+          case GET_SPEED: currentSpeed = hexToDec(dataBytes.substring(0, 2)); obdState = GET_COOLANT; break;
+          case GET_COOLANT: coolant = hexToDec(dataBytes.substring(0, 2)) - 40; obdState = GET_VOLTS; break;
+          case GET_IAT: iat = hexToDec(dataBytes.substring(0, 2)) - 40; obdState = GET_STFT; break;
+          case GET_STFT: stft = (hexToDec(dataBytes.substring(0, 2)) - 128) * 100.0 / 128.0; obdState = GET_LTFT; break;
+          case GET_LTFT: ltft = (hexToDec(dataBytes.substring(0, 2)) - 128) * 100.0 / 128.0; obdState = GET_VACUUM; break;
+          case GET_VACUUM: {
+            int M_idx = obdResponse.indexOf("410B");
+            if (M_idx >= 0) { float mapKpa = strtol(obdResponse.substring(M_idx + 4, M_idx + 6).c_str(), NULL, 16); vacuum = (101.3 - mapKpa) * 0.2953; if (vacuum < 0.0) vacuum = 0.0; }
+            obdState = GET_LOAD; break;
+          }
+          case GET_LOAD: engineLoad = hexToDec(dataBytes.substring(0, 2)) * 100.0 / 255.0; obdState = GET_O2; break;
+          case GET_O2: o2Sensor = hexToDec(dataBytes.substring(0, 2)) / 200.0; obdState = GET_MAF; break;
+          case GET_MAF: {
+            mafGps = (hexToDec(dataBytes.substring(0, 2)) * 256.0 + hexToDec(dataBytes.substring(2, 4))) / 100.0; 
+            obdState = GET_RPM; break;
+          }
+        }
+      } else if (obdState == GET_VOLTS) {
+        obdResponse.replace("V", ""); voltage = obdResponse.toFloat(); if(voltage == 0.0) voltage = 14.1;
+        obdState = GET_IAT;
+      } else { obdState = GET_RPM; }
+    }
+
+        // 🟩 ปรับปรุงใหม่: แยกส่วนคำนวณออกจากกันเด็ดขาด เพื่อให้ไมล์เดินหน้าตลอดเวลาที่รถวิ่ง
+    unsigned long currentTime = millis();
+    float timeElapsedHours = (currentTime - lastFuelCalcTime) / 3600000.0;
+    lastFuelCalcTime = currentTime;
+
+    // 1. ส่วนคำนวณระยะทางไมล์สะสม (ปลดล็อกให้วิ่งทำงานทันทีเมื่อความเร็ว > 0)
+    if (currentSpeed > 0) {
+      virtualOdometer += (float)currentSpeed * timeElapsedHours;
+      tripKm += (float)currentSpeed * timeElapsedHours;
+    }
+
+    // 2. ส่วนคำนวณค่าน้ำมัน (ทำงานแยกต่างหากเมื่อมีค่า MAF ส่งมา)
+    if (mafGps > 0.0) {
+      float fuelGps = mafGps / 14.7;
+      float fuelLitresPerSecond = fuelGps / 740.0;
+      tripFuelLitres += fuelLitresPerSecond * (timeElapsedHours * 3600.0);
+    }
+
+    if (tripFuelLitres > 0.005 && tripKm > 0.02) {
+      tripKpl = tripKm / tripFuelLitres;
+      tripKplValid = true;
+    } else {
+      tripKplValid = false;
+    }
+
+    simulatedGear = (currentSpeed < 20) ? 1 : (currentSpeed < 50) ? 2 : (currentSpeed < 85) ? 3 : (currentSpeed < 110) ? 4 : 5;
+
+
+  // --- 3. ส่วนเรนเดอร์จัดวางองค์ประกอบลงบนแผ่นหน้าจอ ---
+  char buf[48]; // 🟢 แก้ไข: ขยายขนาดบัฟเฟอร์ป้องกันหน่วยความจำล้นตัวอักษรเสียหาย
+  uint16_t themeColor = lcd.color565(173, 255, 47);
+
+  // 🔴 หน้าที่ 1 — หน้าปัดหลักตามภาพตัวอย่าง
+  if (currentPage == 1) {
+    drawTopTachoBarDirect(rpm);
+
+    // แถบสถานะด้านบน
+    lcd.setFont(&fonts::Font0);
+    lcd.setTextSize(1);
+    lcd.setTextColor(themeColor, TFT_BLACK); lcd.drawString("REDLINE", 12, 10);
+    lcd.setTextColor(TFT_GREEN, TFT_BLACK);  lcd.drawString(connected ? "OBD ONLINE" : "OBD OFFLINE", 105, 10);
+    lcd.setTextColor(TFT_WHITE, TFT_BLACK);  lcd.drawString("12:35", 195, 10);
+
+    // กรอบแสดงค่าหลักด้านซ้าย
+    const uint16_t panelLine = lcd.color565(50, 190, 210);
+    lcd.drawRoundRect(8, 55, 215, 172, 8, panelLine);
+
+    // RPM — 7-segment ขนาดใหญ่ที่สุด
+    lcd.fillRect(10, 65, 160, 48, TFT_BLACK);
+    lcd.setFont(&fonts::Font7);
+    //lcd.setTextSize(0.72);
+    lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "%u", (unsigned int)rpm);
+    lcd.drawString(buf, 28, 66);
+    lcd.setFont(&fonts::Font0);
+    lcd.setTextSize(1);
+    lcd.setTextColor(themeColor, TFT_BLACK);
+    lcd.drawString("RPM", 168, 88);
+
+    // SPEED — 7-segment ขนาดกลาง
+    lcd.fillRect(15, 130, 150, 40, TFT_BLACK);
+    lcd.setFont(&fonts::Font7);
+    lcd.setTextSize(0.58);
+    lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "%03d", currentSpeed);
+     lcd.drawString(buf, 45, 130);
+    lcd.setFont(&fonts::Font0);
+    lcd.setTextSize(1);
+    lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+     lcd.drawString("Km/h", 168, 146);
+
+    // ODOMETER — 7-segment ขนาดเล็กที่สุด
+    lcd.fillRect(15, 180, 200, 30, TFT_BLACK);
+    lcd.setFont(&fonts::Font7);
+    lcd.setTextSize(0.40);
+    lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "%.0f", virtualOdometer);
+    lcd.drawString(buf, 65, 180);
+
+    // กล่องข้อมูลด้านขวา
+    int rx = 232, rw = 82, rh = 54;
+    lcd.drawRoundRect(rx, 35, rw, rh, 6, panelLine);
+    lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+    lcd.setTextColor(themeColor, TFT_BLACK); lcd.drawString("COOLANT", rx+6, 40);
+    lcd.setFont(&fonts::Font4); lcd.setTextSize(1);
+    lcd.setTextColor(coolant >= 98 ? TFT_RED : TFT_WHITE, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "%2d", coolant); lcd.drawString(buf, rx+6, 52);
+    lcd.setFont(&fonts::Font0); lcd.drawString("C", rx+54, 62);
+    lcd.drawFastHLine(rx+6, 35 + 44, 70, lcd.color565(40, 40, 40));
+    int coolantBar = constrain(map(coolant, 0, 120, 0, 70), 0, 70);
+    lcd.fillRect(rx+6, 35 + 44, coolantBar, 3, themeColor);
+
+    lcd.drawRoundRect(rx, 96, rw, rh, 6, panelLine);
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(themeColor, TFT_BLACK); lcd.drawString("VOLTAGE", rx+6, 101);
+    lcd.setFont(&fonts::Font4); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "%4.1f", voltage); lcd.drawString(buf, rx+4, 113);
+    lcd.setFont(&fonts::Font0); lcd.drawString("V", rx+66, 123);
+
+    lcd.drawRoundRect(rx, 157, rw, rh, 6, panelLine);
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(themeColor, TFT_BLACK); lcd.drawString("INTAKE", rx+6, 162);
+    lcd.setFont(&fonts::Font4); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "%2d", iat); lcd.drawString(buf, rx+6, 174);
+    lcd.setFont(&fonts::Font0); lcd.drawString("C", rx+54, 184);
+
+    // ปุ่ม NEXT ของหน้าจอหลัก
+    lcd.drawRect(rx, 211, rw, 24, panelLine);
+    lcd.fillRect(rx+2, 213, rw-4, 20, lcd.color565(0, 150, 170));
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_WHITE, lcd.color565(0, 150, 170));
+    lcd.drawCentreString("NEXT", rx + rw/2, 218, 1);
+  }
+  // 🟦 หน้าที่ 2
+  else if (currentPage == 2) {
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_ORANGE, TFT_BLACK); lcd.drawString("PAGE 2: ECU DIAGNOSTIC DATA MONITOR", 10, 10);
+    lcd.drawFastHLine(10, 26, 300, TFT_DARKGREY);
+    int bx = 10, bw = 145, bh = 55;
+    lcd.drawRoundRect(bx, 35, bw, bh, 4, TFT_DARKGREY); lcd.drawString("STFT BANK 1", bx+8, 40);
+    lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_GREEN, TFT_BLACK); snprintf(buf, sizeof(buf), "%+5.1f %%", stft); lcd.drawString(buf, bx+8, 58);
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    lcd.drawRoundRect(bx+155, 35, bw, bh, 4, TFT_DARKGREY); lcd.drawString("LTFT BANK 1", bx+163, 40);
+    lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_GREEN, TFT_BLACK); snprintf(buf, sizeof(buf), "%+5.1f %%", ltft); lcd.drawString(buf, bx+163, 58);
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    lcd.drawRoundRect(bx, 93, bw, bh, 4, TFT_DARKGREY); lcd.drawString("VACUUM PRESSURE", bx+8, 98);
+    lcd.setFont(&fonts::Font2); snprintf(buf, sizeof(buf), "%4.1f inHg", vacuum); lcd.drawString(buf, bx+8, 116);
+    lcd.setFont(&fonts::Font0);
+    lcd.drawRoundRect(bx+155, 93, bw, bh, 4, TFT_DARKGREY); lcd.drawString("COOLANT TEMP", bx+163, 98);
+    lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_CYAN, TFT_BLACK); snprintf(buf, sizeof(buf), "%3d deg C", coolant); lcd.drawString(buf, bx+163, 116);
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    lcd.drawRoundRect(bx, 151, bw, bh, 4, TFT_DARKGREY); lcd.drawString("ENGINE LOAD", bx+8, 156);
+    lcd.setFont(&fonts::Font2); snprintf(buf, sizeof(buf), "%4.1f %%", engineLoad); lcd.drawString(buf, bx+8, 174);
+    lcd.setFont(&fonts::Font0);
+lcd.drawRoundRect(bx+155, 151, bw, bh, 4, TFT_DARKGREY); lcd.drawString("O2 B1S1 VOLTS", bx+163, 156);
+lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_YELLOW, TFT_BLACK); snprintf(buf, sizeof(buf), "%4.2f V", o2Sensor); lcd.drawString(buf, bx+163, 174);
+}
+// 🟨 หน้าที่ 3
+else if (currentPage == 3) {
+lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_YELLOW, TFT_BLACK); lcd.drawString("PAGE 3: VEHICLE MAINTENANCE SCHEDULE", 10, 10);
+lcd.drawFastHLine(10, 26, 300, TFT_DARKGREY);
+lcd.setTextColor(TFT_WHITE, TFT_BLACK); lcd.drawString("CURRENT ODOMETER:", 15, 38);
+lcd.setFont(&fonts::Font2); lcd.setTextColor(themeColor, TFT_BLACK);
+snprintf(buf, sizeof(buf), "%7.1f km", virtualOdometer); lcd.drawString(buf, 140, 34);
+lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+lcd.drawString("1. ENGINE OIL (น้ำมันเครื่อง)", 15, 65);
+snprintf(buf, sizeof(buf), "Next: %6.0f km", serviceOil); lcd.drawString(buf, 205, 65);
+lcd.drawFastHLine(15, 80, 290, lcd.color565(50,50,50));
+lcd.drawString("2. TRANSMISSION FLUID (น้ำมันเกียร์)", 15, 95);
+snprintf(buf, sizeof(buf), "Next: %6.0f km", serviceGear); lcd.drawString(buf, 205, 95);
+lcd.drawFastHLine(15, 110, 290, lcd.color565(50,50,50));
+lcd.drawString("3. SPARK PLUGS (หัวเทียนอิริเดียม)", 15, 125);
+snprintf(buf, sizeof(buf), "Next: %6.0f km", servicePlug); lcd.drawString(buf, 205, 125);
+lcd.drawFastHLine(15, 140, 290, lcd.color565(50,50,50));
+lcd.fillRect(10, 212, 110, 24, lcd.color565(120, 20, 20));
+lcd.drawRect(10, 212, 110, 24, TFT_RED);
+lcd.setTextColor(TFT_WHITE, lcd.color565(120, 20, 20));
+lcd.drawString("🚀 CSV TO NAS", 18, 220);
+lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
+snprintf(buf, sizeof(buf), "Status: %s", uploadStatus.c_str());
+lcd.drawString(buf, 130, 220);
+}
+  // 🟢 หน้าที่ 4: TRIP FUEL ECONOMY & MAF DATA (เติมเต็มโครงสร้างระบบที่ขาดหายไป)
+  else if (currentPage == 4) {
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_CYAN, TFT_BLACK);
+    lcd.drawString("PAGE 4: TRIP FUEL ECONOMY", 10, 10);
+    lcd.drawFastHLine(10, 26, 300, TFT_DARKGREY);
+
+    lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK); lcd.drawString("TRIP DISTANCE", 18, 43);
+    lcd.setFont(&fonts::Font4); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "%.2f km", tripKm); lcd.drawString(buf, 18, 58);
+
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK); lcd.drawString("FUEL USED (EST.)", 18, 105);
+    lcd.setFont(&fonts::Font4); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "%.3f L", tripFuelLitres); lcd.drawString(buf, 18, 120);
+
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK); lcd.drawString("AVERAGE ECONOMY", 18, 166);
+    lcd.setFont(&fonts::Font4); lcd.setTextColor(themeColor, TFT_BLACK);
+    if (tripKplValid) {
+      snprintf(buf, sizeof(buf), "%.2f KPL", tripKpl);
+    } else {
+      snprintf(buf, sizeof(buf), "--.-- KPL");
+    }
+    lcd.drawString(buf, 18, 181);
+
+    // ปุ่ม RESET TRIP สีแดงซ้ายล่าง
+    lcd.fillRect(10, 212, 110, 24, lcd.color565(120, 20, 20));
+    lcd.drawRect(10, 212, 110, 24, TFT_RED);
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_WHITE, lcd.color565(120, 20, 20));
+    lcd.drawString("RESET TRIP", 22, 220);
+
+    // แสดงค่าความเร็วมวลอากาศ MAF สดๆ ด้านขวาปุ่มรีเซ็ต
+    lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    lcd.drawString("MAF: ", 140, 220);
+    snprintf(buf, sizeof(buf), "%.1f g/s", mafGps);
+    lcd.drawString(buf, 175, 220);
+  }
+
+  // 🔘 วาดปุ่ม "NEXT" ขวาล่างสุด (ส่วนแสดงผลปุ่มกดหน้าจอ ให้แสดงผลตลอดเวลาทุกหน้าเด่นชัด)
+  lcd.fillRect(235, 212, 80, 24, lcd.color565(20, 50, 20));
+  lcd.drawRect(235, 212, 80, 24, themeColor);
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(themeColor, lcd.color565(20, 50, 20));
+  lcd.drawString("NEXT ⏩", 256, 220);
+
+  // -------------------------------------------------------------------------
+  // 💾 [กลไกสำคัญ] ระบบวงจรสั่งบันทึกข้อมูลลง SD Card แบบ "อิสระเด็ดขาด"
+  // ย้ายออกมาอยู่นอกเงื่อนไขสถานะเชื่อมต่อรถ เพื่อบังคับให้บันทึกตลอดเวลาทุกลูปวินาทีครับน้า
+  // -------------------------------------------------------------------------
+  if (millis() - lastLogTime >1000) {
+    lastLogTime = millis();
+    logDataToSD(); // เรียกฟังก์ชันสลักค่าและวันเวลาลงแผ่นชิป FAT32 ทันที
+  }
+
+  delay(10); // หน่วงสเกลเวลาสั้นๆ ป้องกันหน้าจอกระพริบและลดภาระบอร์ด
+  }
+ } 
