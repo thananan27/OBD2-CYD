@@ -1,0 +1,120 @@
+#define LGFX_USE_V1
+#include <LovyanGFX.hpp>
+#include <FS.h>
+#include <SD.h>
+#include <SPI.h>
+
+class LGFX_ESP32_2432S028 : public lgfx::LGFX_Device {
+    lgfx::Panel_ILI9341  _panel_instance;
+    lgfx::Bus_SPI        _bus_instance;
+    lgfx::Touch_XPT2046  _touch_instance;
+public:
+    LGFX_ESP32_2432S028() {
+        {
+            auto cfg = _bus_instance.config();
+            cfg.spi_host = HSPI_HOST; 
+            cfg.spi_mode = 0;
+            cfg.freq_write = 40000000; 
+            cfg.freq_read  = 16000000;
+            cfg.pin_sclk = 14; 
+            cfg.pin_mosi = 13; 
+            cfg.pin_miso = 12; 
+            cfg.pin_dc   = 2;
+            _bus_instance.config(cfg); _panel_instance.setBus(&_bus_instance);
+        }
+        {
+            auto cfg = _panel_instance.config();
+            cfg.pin_cs     = 15; 
+            cfg.pin_rst    = -1; 
+            cfg.panel_width  = 240; 
+            cfg.panel_height = 320;
+            cfg.offset_rotation = 1; 
+            _panel_instance.config(cfg);
+        }
+        {
+            auto cfg = _touch_instance.config();
+            cfg.x_min      = 300; 
+            cfg.x_max      = 3900; 
+            cfg.y_min      = 200; 
+            cfg.y_max      = 3700;
+            cfg.pin_int    = 36; 
+            cfg.bus_shared = false; 
+            cfg.offset_rotation = 1; 
+            cfg.spi_host   = -1; 
+            cfg.pin_sclk   = 25; 
+            cfg.pin_mosi   = 32; 
+            cfg.pin_miso   = 39; 
+            cfg.pin_cs     = 33;       
+            _touch_instance.config(cfg); _panel_instance.setTouch(&_touch_instance); 
+        }
+        setPanel(&_panel_instance);
+    }
+};
+
+LGFX_ESP32_2432S028  tft; 
+SPIClass sdSPI(VSPI);
+
+#define SD_CS   5
+#define SD_SCLK 18
+#define SD_MISO 19
+#define SD_MOSI 23
+#define BL_PIN  21 // ขาไฟจอ
+
+void setup() {
+  Serial.begin(115200);
+  delay(500); 
+
+  // 1. บังคับเปิดไฟ Backlight ที่ขา 21 ให้สว่างทันที
+  pinMode(BL_PIN, OUTPUT);
+  digitalWrite(BL_PIN, HIGH);
+
+  // 2. เปิดใช้งานหน้าจอ
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLUE);
+  tft.drawString("Initializing SD Card...", 10, 10);
+  
+  // 3. ปิดสัญญาณหน้าจอ/ทัชชั่วคราวเพื่อรอเคลียร์บัสให้ SD Card
+  pinMode(15, OUTPUT);
+  digitalWrite(15, HIGH);
+  pinMode(33, OUTPUT);
+  digitalWrite(33, HIGH);
+  delay(50);
+
+  // 4. เริ่มต้นบัส SPI ของ SD Card
+  sdSPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH); 
+
+  bool sdSuccess = SD.begin(SD_CS, sdSPI, 4000000); 
+
+  // 5. คืนบัสกลับไปให้หน้าจอทำงาน
+  digitalWrite(15, LOW); 
+  digitalWrite(33, LOW);
+  delay(50);
+
+  // 6. แสดงผลลัพธ์
+  if (!sdSuccess) {
+    Serial.println("Card Mount Failed");
+    tft.fillScreen(TFT_RED);
+    tft.drawString("SD Card Failed!", 10, 10);
+    return;
+  }
+
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  Serial.printf("SD Card Size: %lluMB\n", cardSize);
+  
+  tft.fillScreen(TFT_GREEN);
+  tft.setTextColor(TFT_BLACK);
+  tft.drawString("SD Card Success!", 10, 10);
+  tft.drawString("Touch the screen...", 10, 30);
+}
+
+void loop() {
+  uint16_t x, y;
+  if (tft.getTouch(&x, &y)) {
+    tft.fillCircle(x, y, 4, TFT_WHITE);
+    Serial.printf("Touch: X=%d, Y=%d\n", x, y);
+  }
+  delay(10);
+}
