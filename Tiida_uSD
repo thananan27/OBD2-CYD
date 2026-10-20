@@ -396,19 +396,17 @@ void loop() {
   mafGps = 4.5;           // ใส่ค่า MAF จำลองเพื่อให้ระบบน้ำมันทำงาน
   // =======================================================
   // --- 1. ระบบเช็กทัชสกรีนสลับหน้าจอ (ปุ่ม NEXT ขวาล่าง) ---
-  int touchX = 0, touchY = 0;
+ int touchX = 0, touchY = 0;
   if (lcd.getTouch(&touchX, &touchY)) {
-    // ปุ่ม NEXT ขวาล่าง สลับหน้าจอ (ขยับพิกัดให้ตรงกับตัวรถมากขึ้น)
-    if (touchX >= 220 && touchX <= 320 && touchY >= 200 && touchY <= 240) {
-      if (millis() - lastPagePress > 400) {
+    if (touchX >= 210 && touchX <= 320 && touchY >= 180 && touchY <= 240) {
+      if (millis() - lastPagePress > 350) {
         lastPagePress = millis();
         currentPage++;
-        if (currentPage > 4) {
-          currentPage = 1;
-        }
-        lcd.fillScreen(TFT_BLACK); 
+        if (currentPage > 4) currentPage = 1;
+        lcd.fillScreen(TFT_BLACK);
       }
     }
+ 
     // ปุ่มกดส่งข้อมูล CSV to NAS (หน้า 3 ซ้ายล่าง)
     /* if (currentPage == 3 && touchX >= 10 && touchX <= 110 && touchY >= 200 && touchY <= 240) {
       if (millis() - lastPagePress > 800) {
