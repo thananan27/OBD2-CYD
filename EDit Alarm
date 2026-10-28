@@ -914,34 +914,55 @@ lcd.setFont(&fonts::Font0); lcd.drawString("C", rx+54, 62);
 
   }
   // 🟨 หน้าที่ 3: VEHICLE MAINTENANCE SCHEDULE (เวอร์ชันขยายขนาดฟอนต์ใหญ่เต็มตา)
-  else if (currentPage == 3) {
-    lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_YELLOW, TFT_BLACK); 
-    lcd.drawString("PAGE 3: MAINTENANCE SCHEDULE", 10, 8);
-    lcd.drawFastHLine(10, 26, 300, TFT_DARKGREY);
-    
-    // แสดงเลขไมล์ปัจจุบัน ตัวหนาเบิ้มอ่านง่ายมาก
-    lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_WHITE, TFT_BLACK); lcd.drawString("ODO:", 12, 36);
-    lcd.setFont(&fonts::Font4); lcd.setTextColor(themeColor, TFT_BLACK);
-    snprintf(buf, sizeof(buf), "%7.1f km", virtualOdometer); lcd.drawString(buf, 65, 32);
-    
-    // รายการเช็กระยะ ขยายใช้ฟอนต์เบอร์ 2 อ่านง่ายเวลาวิ่งรถ
-    lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    
-    lcd.drawString("1. ENGINE OIL (น้ำมันเครื่อง)", 12, 68);
-    lcd.setTextColor(TFT_CYAN, TFT_BLACK); snprintf(buf, sizeof(buf), "Next: %6.0f km", serviceOil); lcd.drawString(buf, 15, 88);
+else if (currentPage == 3) {
+  lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+  lcd.drawString("PAGE 3: MAINTENANCE SCHEDULE", 10, 8);
+  lcd.drawFastHLine(10, 26, 300, TFT_DARKGREY);
 
+  // แสดงเลขไมล์ปัจจุบัน
+  lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_WHITE, TFT_BLACK); lcd.drawString("ODO:", 12, 36);
+  lcd.setFont(&fonts::Font4); lcd.setTextColor(themeColor, TFT_BLACK);
+  snprintf(buf, sizeof(buf), "%7.1f km", virtualOdometer); lcd.drawString(buf, 65, 32);
 
+  // 1. ตรวจสอบรอบน้ำมันเครื่อง (Engine Oil)
+  float remOil = serviceOil - virtualOdometer;
+  uint16_t oilColor = TFT_GREEN;
+  if (remOil <= 0) oilColor = TFT_RED;                // เลยระยะแล้ว
+  else if (remOil <= 500.0f) oilColor = TFT_ORANGE;   // เตือนล่วงหน้า 500 km
 
-    lcd.drawFastHLine(10, 110, 215, lcd.color565(60, 60, 60));
-    
-    lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK); lcd.drawString("2. GEAR FLUID (น้ำมันเกียร์)", 12, 116);
-    lcd.setTextColor(TFT_CYAN, TFT_BLACK); snprintf(buf, sizeof(buf), "Next: %6.0f km", serviceGear); lcd.drawString(buf, 15, 136);
-    lcd.drawFastHLine(10, 158, 215, lcd.color565(60, 60, 60));
-    
-    lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK); lcd.drawString("3. SPARK PLUGS (หัวเทียน)", 12, 164);
-    lcd.setTextColor(TFT_CYAN, TFT_BLACK); snprintf(buf, sizeof(buf), "Next: %6.0f km", servicePlug); lcd.drawString(buf, 15, 184);
-    
-  }
+  lcd.setFont(&fonts::Font2); lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.drawString("1. ENGINE OIL (น้ำมันเครื่อง)", 12, 68);
+  lcd.setTextColor(oilColor, TFT_BLACK); 
+  snprintf(buf, sizeof(buf), "Next: %6.0f km (Rem: %4.0f)", serviceOil, remOil); 
+  lcd.drawString(buf, 15, 88);
+  lcd.drawFastHLine(10, 110, 215, lcd.color565(60, 60, 60));
+
+  // 2. ตรวจสอบรอบน้ำมันเกียร์ (Gear Fluid)
+  float remGear = serviceGear - virtualOdometer;
+  uint16_t gearColor = TFT_GREEN;
+  if (remGear <= 0) gearColor = TFT_RED;
+  else if (remGear <= 500.0f) gearColor = TFT_ORANGE;
+
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK); 
+  lcd.drawString("2. GEAR FLUID (น้ำมันเกียร์)", 12, 116);
+  lcd.setTextColor(gearColor, TFT_BLACK); 
+  snprintf(buf, sizeof(buf), "Next: %6.0f km (Rem: %4.0f)", serviceGear, remGear); 
+  lcd.drawString(buf, 15, 136);
+  lcd.drawFastHLine(10, 158, 215, lcd.color565(60, 60, 60));
+
+  // 3. ตรวจสอบรอบหัวเทียน (Spark Plugs)
+  float remPlug = servicePlug - virtualOdometer;
+  uint16_t plugColor = TFT_GREEN;
+  if (remPlug <= 0) plugColor = TFT_RED;
+  else if (remPlug <= 500.0f) plugColor = TFT_ORANGE;
+
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK); 
+  lcd.drawString("3. SPARK PLUGS (หัวเทียน)", 12, 164);
+  lcd.setTextColor(plugColor, TFT_BLACK); 
+  snprintf(buf, sizeof(buf), "Next: %6.0f km (Rem: %4.0f)", servicePlug, remPlug); 
+  lcd.drawString(buf, 15, 184);
+}
+
   // 🟢 หน้าที่ 4: TRIP FUEL ECONOMY & MAF DATA (เติมเต็มโครงสร้างระบบที่ขาดหายไป)
   else if (currentPage == 4) {
     lcd.setFont(&fonts::Font0); lcd.setTextColor(TFT_CYAN, TFT_BLACK);
@@ -1025,6 +1046,29 @@ lcd.setFont(&fonts::Font0); lcd.drawString("C", rx+54, 62);
     }
     lcd.fillRoundRect(10, 212, 125, 24, 4, lcd.color565(0, 70, 90));
     lcd.setTextColor(TFT_WHITE, lcd.color565(0, 70, 90)); lcd.drawString("REFRESH CSV", 18, 220);
+    // วางต่อท้ายบล็อกแสดงค่า CSV RECORDS บรรทัดที่ 112 ในหน้า Page 6 เดิม
+lcd.drawFastHLine(10, 135, 300, TFT_DARKGREY);
+lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+lcd.drawString("SYSTEM ALERTS:", 12, 142);
+
+int alertY = 160;
+if ((serviceOil - logLastOdo) <= 500) {
+  lcd.setTextColor(TFT_ORANGE, TFT_BLACK);
+  lcd.drawString("! OIL CHANGE REQUIRED SOON", 12, alertY); alertY += 16;
+}
+if ((serviceGear - logLastOdo) <= 500) {
+  lcd.setTextColor(TFT_ORANGE, TFT_BLACK);
+  lcd.drawString("! GEAR FLUID CHECK REQUIRED", 12, alertY); alertY += 16;
+}
+if ((servicePlug - logLastOdo) <= 500) {
+  lcd.setTextColor(TFT_ORANGE, TFT_BLACK);
+  lcd.drawString("! SPARK PLUGS REPLACEMENT", 12, alertY); alertY += 16;
+}
+if (alertY == 160) {
+  lcd.setTextColor(TFT_GREEN, TFT_BLACK);
+  lcd.drawString("ALL SYSTEMS NORMAL", 12, 160);
+}
+
   }
 
   // 🔘 วาดปุ่ม "NEXT" ขวาล่างสุด (ส่วนแสดงผลปุ่มกดหน้าจอ ให้แสดงผลตลอดเวลาทุกหน้าเด่นชัด)
