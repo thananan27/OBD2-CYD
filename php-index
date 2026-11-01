@@ -1,0 +1,287 @@
+<?php
+// 1. ตั้งค่าการเชื่อมต่อฐานข้อมูล MySQL
+$servername = "localhost";
+$username = "root"; 
+$password = "";     
+$dbname = "obdii";
+
+$conn = new mysqli($servername, $username, $password, $dbname);
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
+
+// 2. ลอจิกปุ่มกดลบข้อมูลล้างค่าของวันนี้ (Clear Data Trigger)
+if (isset($_POST['action']) && $_POST['action'] == 'clear_today') {
+    $current_date = date('Y-m-d');
+    $sql_delete = "DELETE FROM vehicle_logs WHERE DATE(DateTime) = '$current_date'";
+    if ($conn->query($sql_delete) === TRUE) {
+        echo "<script>alert('ลบข้อมูลของวันนี้ออกเรียบร้อยแล้ว!'); window.location.href='dashboard.php';</script>";
+    } else {
+        echo "<script>alert('เกิดข้อผิดพลาด: " . $conn->error . "');</script>";
+    }
+}
+
+// 3. ระบบเลือกดูข้อมูลย้อนหลังตามวัน (เริ่มต้นเป็นวันปัจจุบันหากไม่ได้ค้นหา)
+$selected_date = isset($_GET['search_date']) ? $_GET['search_date'] : date('Y-m-d');
+
+// 4. ดึงข้อมูลแถวล่าสุด (Current Status) ของวันที่เลือกมาแสดงในกล่องข้อความ
+$sql_latest = "SELECT * FROM vehicle_logs WHERE DATE(DateTime) = '$selected_date' ORDER BY DateTime DESC LIMIT 1";
+$result_latest = $conn->query($sql_latest);
+$latest = $result_latest->fetch_assoc();
+
+// หากวันนั้นไม่มีข้อมูลเลย ให้ดึงแถวล่าสุดจริงๆ ในตารางมาโชว์ก่อนเพื่อไม่ให้หน้าจอว่างเปล่า
+if (!$latest) {
+    $sql_latest = "SELECT * FROM vehicle_logs ORDER BY DateTime DESC LIMIT 1";
+    $result_latest = $conn->query($sql_latest);
+    $latest = $result_latest->fetch_assoc();
+}
+
+// 5. ดึงข้อมูลสำหรับพล็อตลง 2 กราฟย่อย (จำกัด 100 แถวล่าสุดตามวันที่เลือก)
+$sql_chart = "SELECT DateTime, Rpm, Speed, engineLoad, Slcd, Llcd, O2Sensor FROM vehicle_logs WHERE DATE(DateTime) = '$selected_date' ORDER BY DateTime DESC LIMIT 100";
+$result_chart = $conn->query($sql_chart);
+
+$chart_labels = [];
+$chart_rpm = [];
+$chart_speed = [];
+$chart_load = [];
+$chart_trim = [];
+$chart_o2 = [];
+
+while($row = $result_chart->fetch_assoc()) {
+    array_unshift($chart_labels, date('H:i:s', strtotime($row['DateTime'])));
+    array_unshift($chart_rpm, $row['Rpm']);
+    array_unshift($chart_speed, $row['Speed']);
+    array_unshift($chart_load, $row['engineLoad']);
+    array_unshift($chart_trim, ($row['Slcd'] + $row['Llcd'])); // รวมค่าชดเชยน้ำมันสั้นและยาวตรงนี้
+    array_unshift($chart_o2, $row['O2Sensor']);
+}
+
+// 6. ดึงข้อมูลเหตุการณ์ที่ค่า Slcd + Llcd รวมกันมากกว่า 10 (Fuel Trim ผิดปกติ) เพื่อโชว์ในตาราง
+$sql_alerts = "SELECT DateTime, Slcd, Llcd, O2Sensor, Vacuum, engineLoad, Speed, Rpm 
+               FROM vehicle_logs 
+               WHERE (Slcd + Llcd) > 10 AND DATE(DateTime) = '$selected_date'
+               ORDER BY DateTime DESC";
+$result_alerts = $conn->query($sql_alerts);
+
+$conn->close();
+?>
+
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nissan Tiida 1.8L OBD-II Dashboard</title>
+    <style>
+        body { background-color: #f4f6f9; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 30px; color: #333; }
+        .container { max-width: 1300px; margin: 0 auto; }
+        .header-area { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; flex-wrap: wrap; gap: 15px; }
+        .action-boxes { display: flex; gap: 15px; align-items: center; flex-wrap: wrap; }
+        .search-box { background: white; padding: 12px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); display: flex; gap: 10px; align-items: center; }
+        .search-box input[type="date"] { padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 0.95rem; }
+        .btn-search { background: #0d6efd; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 0.95rem; }
+        .btn-search:hover { background: #0b5ed7; }
+        .btn-danger { background-color: #dc3545; color: white; border: none; padding: 10px 18px; border-radius: 4px; cursor: pointer; font-size: 0.95rem; font-weight: bold; }
+        .btn-danger:hover { background-color: #bb2d3b; }
+        
+        .row { display: flex; flex-wrap: wrap; gap: 20px; margin-bottom: 30px; }
+        .col-md-3 { flex: 1; min-width: 240px; }
+        .col-md-6 { flex: 1; min-width: 550px; }
+        .col-md-4 { flex: 1; min-width: 320px; }
+        .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); box-sizing: border-box; }
+        .card-alert { background: #fff5f5; border-left: 5px solid #dc3545; }
+        .fw-bold { font-weight: bold; }
+        .text-muted { color: #6c757d; font-size: 0.85rem; text-transform: uppercase; margin-bottom: 5px; }
+        .badge { background: #198754; color: white; padding: 8px 12px; border-radius: 6px; font-size: 0.9rem; display: inline-block; margin-top: 5px; }
+        .border-bottom { border-bottom: 1px solid #dee2e6; padding-bottom: 12px; margin-bottom: 15px; display: flex; justify-content: space-between; align-items: center; }
+        
+        .table-responsive { width: 100%; overflow-x: auto; margin-top: 15px; }
+        table { width: 100%; border-collapse: collapse; text-align: left; background: white; }
+        th, td { padding: 12px; border-bottom: 1px solid #dee2e6; font-size: 0.95rem; }
+        th { background-color: #f8f9fa; color: #495057; font-weight: 600; }
+        tr:hover { background-color: #f8f9fa; }
+        .text-danger { color: #dc3545; font-weight: bold; }
+    </style>
+    <!-- เรียกใช้ไฟล์สคริปต์วาดกราฟจากในเครื่องแบบ Offline -->
+    <script src="chart.umd.js"></script>
+</head>
+<body>
+
+<div class="container">
+    <!-- ส่วนหัวหน้าจอและชุดควบคุมการทำงาน -->
+    <div class="header-area">
+        <div>
+            <h1 class="fw-bold" style="margin:0 0 5px 0;">🚗 Nissan Tiida 1.8L Dashboard</h1>
+            <span class="badge">📅 แสดงข้อมูลของวันที่: <?php echo $selected_date; ?></span>
+        </div>
+        
+        <div class="action-boxes">
+            <!-- ปุ่มค้นหาประวัติข้อมูลย้อนหลัง -->
+            <form method="GET" action="" class="search-box" style="margin:0;">
+                <label for="search_date" class="fw-bold" style="font-size:0.9rem; color:#495057;">ดูย้อนหลัง:</label>
+                <input type="date" id="search_date" name="search_date" value="<?php echo $selected_date; ?>">
+                <button type="submit" class="btn-search">ค้นหา</button>
+            </form>
+
+            <!-- ปุ่มสั่งล้างข้อมูลทดสอบของวันนี้ -->
+            <form method="POST" action="" onsubmit="return confirm('คุณแน่ใจใช่ไหมที่จะลบข้อมูลทั้งหมดของวันนี้ออกจากระบบ?');" style="margin:0;">
+                <input type="hidden" name="action" value="clear_today">
+                <button type="submit" class="btn-danger">🧹 ลบข้อมูลของวันนี้</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- ส่วนที่ 1: แผงกล่องข้อมูลดิบสรุปสถานะล่าสุด (Summary Cards) -->
+    <div class="row">
+        <div class="col-md-3">
+            <div class="card">
+                <div class="text-muted">เลขไมล์สะสม</div>
+                <h2 class="fw-bold" style="color:#0d6efd; margin:10px 0 0 0;"><?php echo number_format($latest['Odometer'] ?? 0, 1); ?> <span style="font-size:1rem; color:#6c757d;">km</span></h2>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card">
+                <div class="text-muted">ระยะทางทริป</div>
+                <h2 class="fw-bold" style="color:#198754; margin:10px 0 0 0;"><?php echo number_format($latest['TripKm'] ?? 0, 2); ?> <span style="font-size:1rem; color:#6c757d;">km</span></h2>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card">
+                <div class="text-muted">อัตราสิ้นเปลืองน้ำมัน</div>
+                <h2 class="fw-bold" style="color:#0dcaf0; margin:10px 0 0 0;"><?php echo number_format($latest['TripKpl'] ?? 0, 2); ?> <span style="font-size:1rem; color:#6c757d;">km/L</span></h2>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card">
+                <div class="text-muted">ความร้อนน้ำหล่อเย็น</div>
+                <h2 class="fw-bold" style="color:#ffc107; margin:10px 0 0 0;"><?php echo number_format($latest['Coolant'] ?? 0, 1); ?> <span style="font-size:1rem; color:#6c757d;">°C</span></h2>
+            </div>
+        </div>
+    </div>
+
+    <!-- ส่วนที่ 2: ระบบแสดงผลแบบแยก 2 กราฟย่อยคู่กันเพื่อจับอาการเชื้อเพลิงบางรอบสูง -->
+    <div class="row">
+        <!-- กราฟที่ 1: แสดงพฤติกรรมการควบคุมรถ -->
+        <div class="col-md-6">
+            <div class="card">
+                <h3 class="fw-bold" style="margin-top:0; margin-bottom:20px;">📈 1. สภาวะเครื่องยนต์ (RPM vs Engine Load)</h3>
+                <canvas id="drivingStateChart" style="width:100%; max-height:280px;"></canvas>
+            </div>
+        </div>
+        <!-- กราฟที่ 2: แสดงสัญญาณตอบสนองของนํ้ามันเมื่อรอบพุ่ง -->
+        <div class="col-md-6">
+            <div class="card">
+                <h3 class="fw-bold" style="margin-top:0; margin-bottom:20px;">⛽ 2. การจ่ายน้ำมัน (Fuel Trim vs O2 Sensor)</h3>
+                <canvas id="fuelResponseChart" style="width:100%; max-height:280px;"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- ส่วนที่ 3: ตารางค่าพารามิเตอร์ระบบไฟ และตารางรายงานแจ้งเตือน (Alert Logs) -->
+    <div class="row">
+        <!-- ฝั่งซ้าย: กล่องสรุปสถานะพารามิเตอร์ย่อย -->
+        <div class="col-md-4">
+            <div class="card" style="height: 100%;">
+                <h3 class="fw-bold" style="margin-top:0; margin-bottom:20px;">⚙️ สรุปค่าระบบไฟฟ้าและไอดีล่าสุด</h3>
+                <div class="border-bottom"><span>ความเร็วรถ (Speed)</span><strong><?php echo number_format($latest['Speed'] ?? 0, 0); ?> km/h</strong></div>
+                <div class="border-bottom"><span>แรงดันไฟแบตเตอรี่ (Voltage)</span><strong><?php echo number_format($latest['Voltage'] ?? 0, 2); ?> V</strong></div>
+แรงดูดท่อไอดี (Vacuum)<?php echo number_format($latest['Vacuum'] ?? 0, 0); ?>
+เซนเซอร์ออกซิเจน (O2 Sensor)<?php echo number_format($latest['O2Sensor'] ?? 0, 2); ?> V
+ค่าชดเชยน้ำมันรวม (Slcd+Llcd)<?php echo number_format(($latest['Slcd'] ?? 0) + ($latest['Llcd'] ?? 0), 2); ?> %
+
+🚨 บันทึกเหตุการณ์ค่าชดเชยเชื้อเพลิงผิดปกติ (Slcd + Llcd > 10)
+จังหวะเวลาที่กล่องรถยนต์อ่านเจอปัญหาส่วนผสมน้ำมันเพี้ยนผิดปกติเกิน 10% เพื่อเช็คแรงดันระบบเชื้อเพลิงหรือท่อร่วมไอดีรั่ว
+<?php 
+if ($result_alerts && $result_alerts->num_rows > 0) {
+    while($alert = $result_alerts->fetch_assoc()) {
+        $total_trim = $alert['Slcd'] + $alert['Llcd'];
+        echo "";
+        echo "" . date('H:i:s', strtotime($alert['DateTime'])) . "";
+        echo "" . number_format($total_trim, 2) . " %";
+        echo "" . number_format($alert['O2Sensor'], 2) . "";
+        echo "" . number_format($alert['Vacuum'], 0) . "";
+        echo "" . number_format($alert['engineLoad'], 1) . " %";
+        echo "" . number_format($alert['Speed'], 0) . "";
+        echo "" . number_format($alert['Rpm'], 0) . "";
+        echo "";
+    }
+} else {
+    echo "🟢 วันนี้สัดส่วนน้ำมันสมบูรณ์ดี ไม่พบช่วงที่ค่าชดเชยน้ำมันเพี้ยนเกินเกณฑ์เลย";
+}
+?>
+
+เวลาบันทึก
+	Slcd + Llcd
+	O2 (V)
+	Vacuum
+	Load (%)
+	Speed
+	RPM
+
+const timeLabels = ;
+// --- โครงสร้างกราฟย่อยที่ 1: พฤติกรรมการขับขี่ (RPM vs Load) ---
+const ctx1 = document.getElementById('drivingStateChart').getContext('2d');
+new Chart(ctx1, {
+type: 'line',
+data: {
+labels: timeLabels,
+datasets: [
+{
+label: 'รอบเครื่องยนต์ (RPM)',
+data: ,
+borderColor: '#0d6efd',
+backgroundColor: 'rgba(13, 110, 253, 0.05)',
+yAxisID: 'y_rpm',
+tension: 0.1
+},
+{
+label: 'ภาระเครื่องยนต์ (Engine Load %)',
+data: ,
+borderColor: '#fd7e14',
+backgroundColor: 'rgba(253, 126, 20, 0.05)',
+yAxisID: 'y_load',
+tension: 0.1
+}
+]
+},
+options: {
+responsive: true,
+scales: {
+y_rpm: { type: 'linear', position: 'left', title: { display: true, text: 'รอบเครื่อง (RPM)' } },
+y_load: { type: 'linear', position: 'right', min: 0, max: 100, grid: { drawOnChartArea: false }, title: { display: true, text: 'Load (%)' } }
+}
+}
+});
+// --- โครงสร้างกราฟย่อยที่ 2: ระบบเชื้อเพลิงและการตอบสนอง (Fuel Trim vs O2) ---
+const ctx2 = document.getElementById('fuelResponseChart').getContext('2d');
+new Chart(ctx2, {
+type: 'line',
+data: {
+labels: timeLabels,
+datasets: [
+{
+label: 'ค่าชดเชยน้ำมันรวม (Slcd + Llcd %)',
+data: ,
+borderColor: '#dc3545',
+backgroundColor: 'rgba(220, 53, 69, 0.05)',
+yAxisID: 'y_trim',
+tension: 0.1
+},
+{
+label: 'เซนเซอร์ออกซิเจน (O2 Sensor Volt)',
+data: ,
+borderColor: '#6f42c1',
+backgroundColor: 'rgba(111, 66, 193, 0.05)',
+yAxisID: 'y_o2',
+tension: 0.1
+}
+]
+},
+options: {
+responsive: true,
+scales: {
+y_trim: { type: 'linear', position: 'left', title: { display: true, text: 'Fuel Trim (%)' } },
+y_o2: { type: 'linear', position: 'right', min: 0, max: 1.2, grid: { drawOnChartArea: false }, title: { display: true, text: 'O2 Sensor (Volt)' } }
+}
+}
+});
